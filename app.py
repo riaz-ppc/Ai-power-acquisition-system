@@ -418,6 +418,29 @@ with tab_dash:
                 ).properties(height=260, title=f"{metric_col.upper()} over time")
                 st.altair_chart(chart2, use_container_width=True)
 
+            st.markdown("#### Compare by period")
+            st.caption("Month-by-month (or week-by-week) view — a table you read top to bottom, "
+                       "with the change vs. the prior period built in, rather than squinting at a chart.")
+            period_choice = st.selectbox("Group by", ["Month", "Week"], key="dash_period_freq")
+            period_df = metrics.aggregate_by_period(scoped, "M" if period_choice == "Month" else "W")
+            if period_df is None or period_df.empty:
+                st.caption("Not enough data in range to group.")
+            else:
+                metric_col_p = "roas" if brand["business_model"] == "transactional" else "cpa"
+                display_cols = ["period", "spend", "conversions", metric_col_p,
+                                 "spend_change_pct", "conversions_change_pct", f"{metric_col_p}_change_pct"]
+                period_display = period_df[display_cols].rename(columns={
+                    "period": period_choice, "spend": "Spend", "conversions": "Conversions",
+                    metric_col_p: metric_col_p.upper(),
+                    "spend_change_pct": "Spend Δ%", "conversions_change_pct": "Conversions Δ%",
+                    f"{metric_col_p}_change_pct": f"{metric_col_p.upper()} Δ%",
+                })
+                fmt = {"Spend": "{:,.2f}", "Conversions": "{:,.0f}",
+                       "Spend Δ%": "{:+.1f}%", "Conversions Δ%": "{:+.1f}%"}
+                fmt[metric_col_p.upper()] = "{:.2f}x" if metric_col_p == "roas" else "{:,.2f}"
+                fmt[f"{metric_col_p.upper()} Δ%"] = "{:+.1f}%"
+                st.dataframe(period_display.style.format(fmt, na_rep="—"), use_container_width=True)
+
             st.markdown("#### Platform breakdown")
             plat = metrics.aggregate(scoped, by=["platform"])
             st.dataframe(plat.style.format({
@@ -484,15 +507,66 @@ with tab_insights:
             with st.container(border=True):
                 st.markdown(f"{badge.get(ins.severity,'')} **{md_safe(ins.title)}**")
                 st.write(md_safe(ins.detail))
+                if ins.suggested_action:
+                    st.markdown(f"**→ Suggested action:** {md_safe(ins.suggested_action)}")
                 st.caption(f"metric: `{ins.metric}` · threshold: `{md_safe(ins.threshold)}` · formula: `{ins.formula}`")
 
         st.markdown("---")
         st.caption("Period-over-period change (current vs. baseline):")
-        pcols = st.columns(4)
+        # Two rows of two, not four across — a long money string (e.g.
+        # "$36,661.23") clips in a 4-wide st.metric column at normal screen
+        # widths; this gives each tile roughly double the room.
+        prow1 = st.columns(2)
+        prow2 = st.columns(2)
+        pcols = [prow1[0], prow1[1], prow2[0], prow2[1]]
         pcols[0].metric("Spend", money(compare["current"]["spend"], brand["currency"]), pct(compare["pct_change"]["spend"]))
         pcols[1].metric("Conversions", f"{compare['current']['conversions']:,.0f}", pct(compare["pct_change"]["conversions"]))
         pcols[2].metric("CPA", money(compare["current"]["cpa"], brand["currency"]), pct(compare["pct_change"]["cpa"]), delta_color="inverse")
         pcols[3].metric("ROAS", ratio(compare["current"]["roas"]), pct(compare["pct_change"]["roas"]))
+
+        st.markdown("---")
+        st.markdown("#### Trend forecast")
+        st.caption("Where anomalies look backward, this looks forward: a straight-line projection of "
+                   "the last 14 days' momentum, not a seasonality-aware forecast — flagged plainly "
+                   "when the recent trend is too noisy for the line to mean much.")
+        forecast_metric = "roas" if brand["business_model"] == "transactional" else "cpa"
+        forecast_daily = metrics.aggregate(df, by=["date"])
+        forecast = metrics.forecast_trend(forecast_daily, forecast_metric)
+        if forecast is None:
+            st.info("Not enough recent daily history to project a trend yet (need at least 5 days).")
+        else:
+            fmt_val = (lambda v: money(v, brand["currency"])) if forecast_metric == "cpa" else ratio
+            hist_tail = forecast_daily.sort_values("date").dropna(subset=[forecast_metric]).tail(14)
+            hist_chart_df = hist_tail[["date", forecast_metric]].rename(columns={forecast_metric: "value"})
+            hist_chart_df["kind"] = "actual"
+            fut_chart_df = pd.DataFrame(forecast["forecast"])
+            fut_chart_df["date"] = pd.to_datetime(fut_chart_df["date"])
+            fut_chart_df["kind"] = "projected"
+            # connect the two lines visually at the last real point
+            bridge = pd.DataFrame([{"date": hist_tail["date"].iloc[-1], "value": forecast["current_value"], "kind": "projected"}])
+            combined = pd.concat([hist_chart_df, bridge, fut_chart_df], ignore_index=True)
+
+            fc1, fc2 = st.columns([2, 1])
+            with fc1:
+                base = alt.Chart(combined).encode(x="date:T", y=alt.Y("value:Q", title=forecast_metric.upper()))
+                actual_line = base.transform_filter("datum.kind == 'actual'").mark_line(point=True, color="#2a78d6")
+                proj_line = base.transform_filter("datum.kind == 'projected'").mark_line(
+                    point=True, strokeDash=[5, 4], color="#eb6834")
+                st.altair_chart((actual_line + proj_line).properties(height=220), use_container_width=True)
+            with fc2:
+                st.metric(f"Projected {forecast_metric.upper()} in 7 days", fmt_val(forecast["projected_value_end"]),
+                          pct(forecast["pct_change_projected"]), delta_color="inverse" if forecast_metric == "cpa" else "normal")
+                fit_quality = "a fairly consistent trend" if forecast["r_squared"] >= 0.5 else "noisy — treat loosely"
+                st.caption(f"Fit: R²={forecast['r_squared']} ({fit_quality}), based on last {forecast['lookback_points']} days.")
+
+            target_val = brand["target_cpa"] if forecast_metric == "cpa" else brand["target_roas"]
+            if target_val:
+                breaches = (forecast["projected_value_end"] > target_val) if forecast_metric == "cpa" \
+                    else (forecast["projected_value_end"] < target_val)
+                if breaches:
+                    st.warning(f"At this trend, projected {forecast_metric.upper()} in 7 days "
+                               f"({fmt_val(forecast['projected_value_end'])}) would be past your target "
+                               f"({fmt_val(target_val)}) — worth acting before it gets there, not after.")
 
         st.markdown("---")
         st.markdown("#### Anomalies")

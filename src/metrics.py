@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 import pandas as pd
 
 
@@ -48,6 +50,38 @@ def add_derived(df: pd.DataFrame) -> pd.DataFrame:
     if "reach" in df.columns:
         df["frequency"] = (df["impressions"] / df["reach"]).where(df["reach"] > 0)
     return df
+
+
+PERIOD_LABELS = {"D": "Day", "W": "Week", "M": "Month"}
+
+
+def aggregate_by_period(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """
+    Rolls performance rows up into calendar buckets — day, ISO week (Monday
+    start), or calendar month — and adds period-over-period % change columns
+    for spend/conversions/cpa/roas. This is the "compare month by month, or
+    any other way" view: a table a human actually reads top-to-bottom,
+    not a chart they have to squint at to see the third-to-last point.
+    """
+    if df.empty:
+        return df
+    d = df.copy()
+    if freq == "D":
+        d["period"] = d["date"].dt.date.astype(str)
+    elif freq == "W":
+        d["period"] = d["date"].dt.to_period("W-SUN").apply(lambda p: p.start_time.date().isoformat())
+    else:  # "M"
+        d["period"] = d["date"].dt.to_period("M").astype(str)
+
+    g = d.groupby("period", dropna=False).agg(
+        spend=("spend", "sum"), impressions=("impressions", "sum"), clicks=("clicks", "sum"),
+        conversions=("conversions", "sum"), conversion_value=("conversion_value", "sum"),
+    ).reset_index().sort_values("period")
+    g = add_derived(g)
+
+    for col in ("spend", "conversions", "cpa", "roas"):
+        g[f"{col}_change_pct"] = g[col].pct_change() * 100
+    return g
 
 
 def aggregate(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
@@ -142,6 +176,58 @@ def detect_anomalies(daily: pd.DataFrame, metric: str, z_thresh: float = 2.0) ->
     return flags
 
 
+def forecast_trend(daily: pd.DataFrame, metric: str, lookback_days: int = 14,
+                    forecast_days: int = 7) -> dict | None:
+    """
+    Where anomaly detection looks backward ("did something already break"),
+    this looks forward: fits a plain linear trend (ordinary least squares,
+    no external stats dependency — this is the one honest thing a handful
+    of points supports) over the last `lookback_days` and projects it
+    `forecast_days` ahead. This is a straight-line extrapolation of recent
+    momentum, not a seasonality-aware forecast — flagged here rather than
+    dressed up as more sophisticated than it is. Needs >=5 real points in
+    the lookback window; returns None otherwise rather than a forecast
+    built on too little.
+    """
+    if daily.empty or metric not in daily.columns:
+        return None
+    d = daily.sort_values("date").dropna(subset=[metric]).tail(lookback_days)
+    if len(d) < 5:
+        return None
+
+    x = (d["date"] - d["date"].min()).dt.days.to_numpy(dtype=float)
+    y = d[metric].to_numpy(dtype=float)
+    slope, intercept = np.polyfit(x, y, 1)
+
+    last_x = x[-1]
+    last_date = d["date"].max()
+    future_x = np.arange(last_x + 1, last_x + 1 + forecast_days)
+    future_dates = [last_date + pd.Timedelta(days=int(i)) for i in range(1, forecast_days + 1)]
+    future_y = intercept + slope * future_x
+
+    # Fit quality: how much of the day-to-day variance the straight line
+    # actually explains — low r_squared means "this trend line is mostly
+    # noise," which the caller should say plainly rather than presenting
+    # a confident-looking number.
+    fitted = intercept + slope * x
+    ss_res = np.sum((y - fitted) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    return {
+        "slope_per_day": float(slope),
+        "r_squared": round(float(r_squared), 3),
+        "lookback_points": len(d),
+        "forecast": [
+            {"date": fd.date().isoformat(), "value": float(fy)}
+            for fd, fy in zip(future_dates, future_y)
+        ],
+        "current_value": float(y[-1]),
+        "projected_value_end": float(future_y[-1]),
+        "pct_change_projected": float((future_y[-1] - y[-1]) / y[-1] * 100) if y[-1] else None,
+    }
+
+
 def creative_fatigue_candidates(ad_level_df: pd.DataFrame, min_periods: int = 3) -> list[dict]:
     """
     Per ad: prefer the real signal — frequency (impressions ÷ reach) climbing
@@ -226,6 +312,7 @@ class Insight:
     metric: str
     threshold: str
     formula: str
+    suggested_action: str = ""  # what to actually DO about it, not just what's wrong
 
 
 _CCY_SYMBOLS = {"USD": "$", "GBP": "£", "EUR": "€"}
@@ -268,6 +355,9 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
                             f"margin at current spend."),
                     metric="roas", threshold=f"< {iroas_floor:.2f}x",
                     formula="iROAS floor = 1 ÷ contribution margin",
+                    suggested_action="Pause it, or cut its budget hard, until you've changed the "
+                                      "creative/targeting — every day it keeps running at this ROAS "
+                                      "loses money outright, not just underperforms.",
                 ))
             elif target_roas and row["roas"] < target_roas:
                 insights.append(Insight(
@@ -275,6 +365,8 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
                     title=f"{camp}: below target ROAS",
                     detail=f"ROAS is {row['roas']:.2f}x vs. a target of {target_roas:.2f}x.",
                     metric="roas", threshold=f"< {target_roas:.2f}x", formula="target_roas (brand config)",
+                    suggested_action="Still profitable, just underperforming — worth a creative "
+                                      "refresh or tighter targeting before cutting budget outright.",
                 ))
             elif target_roas and row["roas"] >= target_roas * 1.25:
                 insights.append(Insight(
@@ -282,6 +374,9 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
                     title=f"{camp}: strong scale candidate",
                     detail=f"ROAS is {row['roas']:.2f}x, 25%+ above target ({target_roas:.2f}x).",
                     metric="roas", threshold=f">= {target_roas*1.25:.2f}x", formula="target_roas × 1.25",
+                    suggested_action="Increase budget here before anywhere else in the account — "
+                                      "raise it incrementally (e.g. 20-30% at a time) and watch ROAS "
+                                      "over the next few days rather than doubling it in one move.",
                 ))
 
         if business_model == "lead_gen" and target_cpa and row["cpa"] is not None:
@@ -292,6 +387,9 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
                     detail=(f"CPA is {_money(row['cpa'], ccy)} vs. a target of {_money(target_cpa, ccy)} "
                             f"(+15% tolerance breached)."),
                     metric="cpa", threshold=f"> {_money(target_cpa*1.15, ccy)}", formula="target_cpa × 1.15",
+                    suggested_action="Pause or sharply reduce budget now — check the funnel first "
+                                      "(is CTR down, or is lead-to-enrollment down) so the fix "
+                                      "actually addresses what broke, not just the symptom.",
                 ))
             elif row["cpa"] > target_cpa:
                 insights.append(Insight(
@@ -299,6 +397,8 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
                     title=f"{camp}: CPA above target",
                     detail=f"CPA is {_money(row['cpa'], ccy)} vs. a target of {_money(target_cpa, ccy)}.",
                     metric="cpa", threshold=f"> {_money(target_cpa, ccy)}", formula="target_cpa (brand config)",
+                    suggested_action="Not urgent yet — worth tightening targeting or testing new ad "
+                                      "copy before it drifts further past target.",
                 ))
             elif row["cpa"] <= target_cpa * 0.8:
                 insights.append(Insight(
@@ -306,6 +406,8 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
                     title=f"{camp}: efficient scale candidate",
                     detail=f"CPA is {_money(row['cpa'], ccy)}, 20%+ under target ({_money(target_cpa, ccy)}).",
                     metric="cpa", threshold=f"<= {_money(target_cpa*0.8, ccy)}", formula="target_cpa × 0.8",
+                    suggested_action="Increase budget here before anywhere else in the account — "
+                                      "raise it incrementally and watch whether CPA holds as volume grows.",
                 ))
 
     if period_compare:
@@ -317,6 +419,9 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
                 title="Blended CPA rising sharply",
                 detail=f"Blended CPA is up {cpa_chg:.0f}% vs. the baseline period.",
                 metric="cpa", threshold=">= 30% period-over-period", formula="(current − baseline) / baseline",
+                suggested_action="Check the per-campaign table below for which specific campaign(s) "
+                                  "are driving this before touching anything account-wide — a blended "
+                                  "spike is often one or two campaigns, not everything at once.",
             ))
         roas_chg = pct.get("roas")
         if roas_chg is not None and roas_chg <= -25:
@@ -325,6 +430,9 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
                 title="Blended ROAS falling sharply",
                 detail=f"Blended ROAS is down {abs(roas_chg):.0f}% vs. the baseline period.",
                 metric="roas", threshold="<= -25% period-over-period", formula="(current − baseline) / baseline",
+                suggested_action="Check the per-campaign table below for which specific campaign(s) "
+                                  "are driving this before touching anything account-wide — a blended "
+                                  "drop is often one or two campaigns, not everything at once.",
             ))
 
     order = {"critical": 0, "watch": 1, "scale": 2}
