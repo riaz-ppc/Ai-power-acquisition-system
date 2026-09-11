@@ -551,6 +551,58 @@ def creative_fatigue_candidates(ad_level_df: pd.DataFrame, min_periods: int = 3)
     return out
 
 
+def keyword_waste_candidates(df: pd.DataFrame, min_clicks: int = 15) -> list[dict]:
+    """
+    Classic PPC hygiene: a keyword burning real clicks with zero
+    conversions is usually the single highest-ROI thing to fix in a
+    search account. Grounded with the "rule of three" — for zero
+    observed successes in n trials, the upper bound of a 95% confidence
+    interval on the true success rate is approximately 3/n — rather
+    than an arbitrary flat click count. That upper bound is compared
+    against THIS account's own blended conversion rate (from whichever
+    keywords in the same window did convert), so the bar is calibrated
+    to this specific brand and period, not a one-size-fits-all industry
+    rule of thumb. A keyword only surfaces when even its best-case
+    plausible conversion rate is still below what the rest of the
+    account is actually achieving.
+
+    Only Google/Microsoft carry keyword-level data — Meta has no
+    keyword level at all. Needs >= min_clicks clicks to say anything;
+    fewer than that and zero conversions could just be noise, not signal.
+    """
+    if df.empty or "keyword" not in df.columns:
+        return []
+    kw_df = df[df["keyword"].notna() & df["platform"].isin(["google", "microsoft"])]
+    if kw_df.empty:
+        return []
+
+    agg = kw_df.groupby(["platform", "campaign", "keyword"], dropna=False).agg(
+        spend=("spend", "sum"), clicks=("clicks", "sum"), conversions=("conversions", "sum")
+    ).reset_index()
+
+    converting = agg[agg["conversions"] > 0]
+    total_clicks, total_conversions = converting["clicks"].sum(), converting["conversions"].sum()
+    account_cvr = (total_conversions / total_clicks) if total_clicks else None
+
+    candidates = []
+    for _, r in agg.iterrows():
+        if r["clicks"] < min_clicks or r["conversions"] > 0:
+            continue
+        upper_bound_cvr = 3 / r["clicks"]
+        worth_reviewing = account_cvr is None or upper_bound_cvr < account_cvr
+        if not worth_reviewing:
+            continue
+        candidates.append({
+            "platform": r["platform"], "campaign": r["campaign"], "keyword": r["keyword"],
+            "spend": float(r["spend"]), "clicks": int(r["clicks"]),
+            "upper_bound_cvr_pct": round(upper_bound_cvr * 100, 2),
+            "account_cvr_pct": round(float(account_cvr) * 100, 2) if account_cvr is not None else None,
+        })
+
+    candidates.sort(key=lambda c: -c["spend"])
+    return candidates
+
+
 def two_proportion_z_test(conv_a: float, n_a: float, conv_b: float, n_b: float) -> dict:
     """
     Two-proportion z-test for "is variant B's conversion rate really

@@ -799,6 +799,36 @@ with tab_insights:
                     st.success(f"No large efficiency gap between campaigns this period (best vs. worst "
                                f"differ by {gap_pct:.0f}%) — nothing worth disrupting budgets over yet.")
 
+        kw_scoped = df[(df["date"] >= pd.Timestamp(cur_start)) & (df["date"] <= pd.Timestamp(cur_end))]
+        if (kw_scoped["platform"].isin(["google", "microsoft"]) & kw_scoped["keyword"].notna()).any():
+            st.markdown("---")
+            st.markdown("#### Keyword waste")
+            st.caption("Classic PPC hygiene: a keyword burning real clicks with zero conversions is usually "
+                       "the single highest-ROI thing to fix in a search account. Grounded with the "
+                       "\"rule of three\" — for zero conversions in n clicks, the upper bound of a 95% "
+                       "confidence interval on the true conversion rate is ~3/n — compared against this "
+                       "account's own blended conversion rate, not a flat industry rule of thumb. Only "
+                       "Google/Microsoft carry keyword-level data.")
+            waste = metrics.keyword_waste_candidates(kw_scoped)
+            if not waste:
+                st.success("No keywords with enough clicks and zero conversions to flag this period.")
+            else:
+                baseline = waste[0]["account_cvr_pct"]
+                if baseline is not None:
+                    st.caption(f"This account's blended conversion rate (from converting keywords this "
+                               f"period): {baseline:.2f}%.")
+                waste_table = pd.DataFrame([{
+                    "Platform": w["platform"], "Campaign": w["campaign"], "Keyword": w["keyword"],
+                    "Spend": money(w["spend"], brand["currency"]), "Clicks": w["clicks"],
+                    "Best-case CVR (95% upper bound)": f"{w['upper_bound_cvr_pct']:.2f}%",
+                } for w in waste])
+                st.dataframe(waste_table, hide_index=True, use_container_width=True)
+                total_waste_spend = sum(w["spend"] for w in waste)
+                st.warning(f"{len(waste)} keyword(s), {money(total_waste_spend, brand['currency'])} of spend "
+                           f"this period, with a 95%-confidence best case still below this account's own "
+                           f"typical conversion rate — worth pausing or restructuring (tighter match type, "
+                           f"a negative keyword) before spending more on them as-is.")
+
 # ------------------------------------------------------------------ tests --
 
 with tab_tests:
