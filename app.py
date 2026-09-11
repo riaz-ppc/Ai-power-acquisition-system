@@ -555,83 +555,99 @@ with tab_recon:
                 st.success(f"Imported {o_result.row_count} orders.")
                 st.rerun()
 
-    all_orders = db.orders_for_brand(brand_id)
-    if not all_orders:
+    all_orders_unfiltered = db.orders_for_brand(brand_id)
+    if not all_orders_unfiltered:
         st.info("No orders imported yet — drop an order/sales export above to get started.")
     else:
         st.markdown("---")
-        st.markdown("#### Match campaign names")
-        st.caption("Order sheets use shorthand campaign names that rarely match the platform's exact "
-                   "names exactly. Every suggestion below is a guess — confirm or correct each one; "
-                   "nothing is used for reconciliation until you save.")
+        st.markdown("#### Date range")
+        st.caption("Scopes both the orders and the campaign data below to the same period — "
+                   "reconciling different date ranges against each other isn't a fair comparison.")
+        order_dates = [o["order_date"] for o in all_orders_unfiltered]
+        recon_min_d = min(pd.to_datetime(order_dates)).date()
+        recon_max_d = max(pd.to_datetime(order_dates)).date()
+        recon_range = st.date_input("Reconciliation period", (recon_min_d, recon_max_d),
+                                     min_value=recon_min_d, max_value=recon_max_d, key="recon_range")
 
-        unmatched = db.unmatched_raw_campaigns(brand_id)
-        perf_rows = db.rows_for_brand(brand_id)
-        campaigns_by_platform: dict[str, list[str]] = {}
-        for r in perf_rows:
-            campaigns_by_platform.setdefault(r["platform"], [])
-            if r["campaign"] and r["campaign"] not in campaigns_by_platform[r["platform"]]:
-                campaigns_by_platform[r["platform"]].append(r["campaign"])
-        all_known_campaigns = sorted({c for cs in campaigns_by_platform.values() for c in cs})
-
-        if not all_known_campaigns:
-            st.info("No campaign performance data imported yet for this brand — import that first "
-                    "(Import tab) so there's something to match orders against.")
-        elif not unmatched:
-            st.success("All order campaigns are matched.")
+        if len(recon_range) != 2:
+            st.info("Pick an end date to continue.")
         else:
-            order_rows_by_campaign: dict[str, str | None] = {}
-            for o in all_orders:
-                if o["raw_campaign"] and o["raw_campaign"] not in order_rows_by_campaign:
-                    order_rows_by_campaign[o["raw_campaign"]] = o["source"]
+            recon_start, recon_end = str(recon_range[0]), str(recon_range[1])
+            all_orders = db.orders_for_brand(brand_id, recon_start, recon_end)
+            perf_rows = db.rows_for_brand(brand_id, recon_start, recon_end)
 
-            with st.form("campaign_matches"):
-                choices = {}
-                options = ["ignore"] + all_known_campaigns
-                for raw in unmatched:
-                    source = order_rows_by_campaign.get(raw)
-                    platform_hint = orders.SOURCE_TO_PLATFORM.get((source or "").lower())
-                    scoped = campaigns_by_platform.get(platform_hint, []) if platform_hint else all_known_campaigns
-                    suggestion = orders.suggest_campaign_matches(
-                        [raw], {platform_hint: scoped} if platform_hint else campaigns_by_platform
-                    )[raw]
-                    default_idx = options.index(suggestion) if suggestion in options else 0
-                    label = f"{raw}" + (f"  (source: {source})" if source else "")
-                    choices[raw] = st.selectbox(label, options, index=default_idx, key=f"match_{raw}")
-                if st.form_submit_button("Save matches"):
-                    db.set_campaign_matches(brand_id, choices)
-                    st.success("Saved.")
-                    st.rerun()
+            st.markdown("---")
+            st.markdown("#### Match campaign names")
+            st.caption("Order sheets use shorthand campaign names that rarely match the platform's exact "
+                       "names exactly. Every suggestion below is a guess — confirm or correct each one; "
+                       "nothing is used for reconciliation until you save.")
 
-        st.markdown("---")
-        st.markdown("#### Reconciliation")
-        odf = pd.DataFrame([dict(o) for o in all_orders])
-        odf = odf[~odf["matched_campaign"].isin([None, "ignore"])]
-        if odf.empty:
-            st.info("No matched orders yet to reconcile — match campaigns above first.")
-        else:
-            order_totals = odf.groupby("matched_campaign")["amount"].sum().rename("actual_revenue")
-            perf_df = metrics.rows_to_df(perf_rows)
-            claimed_totals = metrics.aggregate(perf_df, by=["campaign"])[["campaign", "conversion_value"]].set_index("campaign")["conversion_value"].rename("platform_claimed")
+            unmatched = db.unmatched_raw_campaigns(brand_id)
+            campaigns_by_platform: dict[str, list[str]] = {}
+            for r in perf_rows:
+                campaigns_by_platform.setdefault(r["platform"], [])
+                if r["campaign"] and r["campaign"] not in campaigns_by_platform[r["platform"]]:
+                    campaigns_by_platform[r["platform"]].append(r["campaign"])
+            all_known_campaigns = sorted({c for cs in campaigns_by_platform.values() for c in cs})
 
-            recon = pd.concat([order_totals, claimed_totals], axis=1).fillna(0.0).reset_index()
-            recon.columns = ["campaign", "actual_revenue", "platform_claimed"]
-            recon["delta"] = recon["actual_revenue"] - recon["platform_claimed"]
-            recon["delta_pct"] = (recon["delta"] / recon["platform_claimed"].replace(0, pd.NA)) * 100
-            recon = recon.sort_values("actual_revenue", ascending=False)
+            if not all_known_campaigns:
+                st.info("No campaign performance data in this date range — import that first "
+                        "(Import tab), or widen the range above, so there's something to match orders against.")
+            elif not unmatched:
+                st.success("All order campaigns are matched.")
+            else:
+                order_rows_by_campaign: dict[str, str | None] = {}
+                for o in all_orders:
+                    if o["raw_campaign"] and o["raw_campaign"] not in order_rows_by_campaign:
+                        order_rows_by_campaign[o["raw_campaign"]] = o["source"]
 
-            t1, t2, t3 = st.columns(3)
-            t1.metric("Actual revenue (orders)", money(recon["actual_revenue"].sum(), brand["currency"]))
-            t2.metric("Platform-claimed revenue", money(recon["platform_claimed"].sum(), brand["currency"]))
-            total_delta_pct = (recon["actual_revenue"].sum() - recon["platform_claimed"].sum()) / recon["platform_claimed"].sum() * 100 if recon["platform_claimed"].sum() else None
-            t3.metric("Overall difference", pct(total_delta_pct))
+                with st.form("campaign_matches"):
+                    choices = {}
+                    options = ["ignore"] + all_known_campaigns
+                    for raw in unmatched:
+                        source = order_rows_by_campaign.get(raw)
+                        platform_hint = orders.SOURCE_TO_PLATFORM.get((source or "").lower())
+                        scoped = campaigns_by_platform.get(platform_hint, []) if platform_hint else all_known_campaigns
+                        suggestion = orders.suggest_campaign_matches(
+                            [raw], {platform_hint: scoped} if platform_hint else campaigns_by_platform
+                        )[raw]
+                        default_idx = options.index(suggestion) if suggestion in options else 0
+                        label = f"{raw}" + (f"  (source: {source})" if source else "")
+                        choices[raw] = st.selectbox(label, options, index=default_idx, key=f"match_{raw}")
+                    if st.form_submit_button("Save matches"):
+                        db.set_campaign_matches(brand_id, choices)
+                        st.success("Saved.")
+                        st.rerun()
 
-            st.dataframe(recon.style.format({
-                "actual_revenue": "{:,.2f}", "platform_claimed": "{:,.2f}",
-                "delta": "{:,.2f}", "delta_pct": "{:+.1f}%",
-            }), use_container_width=True)
-            st.caption("Positive delta = platforms under-claimed vs. real revenue. Negative = platforms "
-                       "over-claimed (common with pixel-based attribution).")
+            st.markdown("---")
+            st.markdown("#### Reconciliation")
+            odf = pd.DataFrame([dict(o) for o in all_orders])
+            odf = odf[~odf["matched_campaign"].isin([None, "ignore"])]
+            if odf.empty:
+                st.info("No matched orders in this date range yet to reconcile — match campaigns above first.")
+            else:
+                order_totals = odf.groupby("matched_campaign")["amount"].sum().rename("actual_revenue")
+                perf_df = metrics.rows_to_df(perf_rows)
+                claimed_totals = metrics.aggregate(perf_df, by=["campaign"])[["campaign", "conversion_value"]].set_index("campaign")["conversion_value"].rename("platform_claimed")
+
+                recon = pd.concat([order_totals, claimed_totals], axis=1).fillna(0.0).reset_index()
+                recon.columns = ["campaign", "actual_revenue", "platform_claimed"]
+                recon["delta"] = recon["actual_revenue"] - recon["platform_claimed"]
+                recon["delta_pct"] = (recon["delta"] / recon["platform_claimed"].replace(0, pd.NA)) * 100
+                recon = recon.sort_values("actual_revenue", ascending=False)
+
+                t1, t2, t3 = st.columns(3)
+                t1.metric("Actual revenue (orders)", money(recon["actual_revenue"].sum(), brand["currency"]))
+                t2.metric("Platform-claimed revenue", money(recon["platform_claimed"].sum(), brand["currency"]))
+                total_delta_pct = (recon["actual_revenue"].sum() - recon["platform_claimed"].sum()) / recon["platform_claimed"].sum() * 100 if recon["platform_claimed"].sum() else None
+                t3.metric("Overall difference", pct(total_delta_pct))
+
+                st.dataframe(recon.style.format({
+                    "actual_revenue": "{:,.2f}", "platform_claimed": "{:,.2f}",
+                    "delta": "{:,.2f}", "delta_pct": "{:+.1f}%",
+                }), use_container_width=True)
+                st.caption("Positive delta = platforms under-claimed vs. real revenue. Negative = platforms "
+                           "over-claimed (common with pixel-based attribution).")
 
 # ------------------------------------------------------------- settings ---
 
