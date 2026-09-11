@@ -42,6 +42,57 @@ class NormalizeResult:
     dropped_row_count: int
     warnings: list[str] = field(default_factory=list)
     status: str = "ok"   # ok / partial / failed
+    needs_period_date: bool = False  # no date column at all — a whole-period
+                                      # summary export (period totals, no daily
+                                      # breakdown). Caller must ask the viewer
+                                      # what date range this file covers before
+                                      # rows can be stored (schema requires a date).
+
+
+def split_multi_table_csv(raw_text: str) -> list[str]:
+    """
+    Some real-world exports aren't a raw platform-UI export at all — they're
+    a custom report (a spreadsheet/Looker export) that stacks several tables
+    in one CSV, each with its own title row, separated by blank lines. e.g.:
+
+        HST Aug 2026 Google Campaign performance,,,,
+        <blank line>
+        Campaign,Clicks,Cost,...          <- real header
+        ...data rows...
+        <blank line>
+        HST Aug 2026 Bing Campaign Performance,,,,
+        <blank line>
+        Campaign name,Clicks,Spend,...    <- a DIFFERENT table's header
+        ...data rows...
+
+    Splits on blank-line-separated blocks and drops a leading title line —
+    detected as a line whose only non-empty cell is the first one — from
+    each block, leaving one clean CSV-text-per-table. A single ordinary
+    CSV (the common case) round-trips as a list of exactly one block.
+    """
+    lines = raw_text.splitlines()
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if line.strip(" ,\t") == "":
+            if current:
+                blocks.append(current)
+                current = []
+        else:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    cleaned = []
+    for block in blocks:
+        if len(block) < 2:
+            continue  # a lone line (title with no table under it, stray blank) — not a table
+        first_cells = [c.strip() for c in block[0].split(",")]
+        non_empty = [c for c in first_cells if c]
+        if len(non_empty) == 1 and len(block) > 2:
+            block = block[1:]  # drop the lone title row
+        cleaned.append("\n".join(block))
+    return cleaned
 
 
 _MONEY_RE = re.compile(r"[^0-9.\-]")
@@ -71,6 +122,26 @@ def _to_iso_date(val) -> str | None:
         return None
 
 
+# Money-column values sometimes carry the currency as a literal symbol
+# ("£3,417.47") rather than in a separate column or header — real exports
+# from custom reporting tools (not the platforms' own UI) do this. Checked
+# as a signal before ever falling back to the brand's configured default,
+# so that default is a last resort, not a guess dressed up as detection.
+_SYMBOL_CURRENCY = {"£": "GBP", "€": "EUR", "$": "USD", "₹": "INR", "৳": "BDT"}
+
+_AGGREGATE_ROW_NAMES = {"total", "totals", "grand total", "sum"}
+
+
+def _detect_symbol_currency(df: pd.DataFrame, header_map: dict) -> str | None:
+    money_cols = [h for h, (f, _c) in header_map.items() if f in ("spend", "conversion_value") and h in df.columns]
+    for h in money_cols:
+        for val in df[h].dropna().astype(str).head(30):
+            v = val.strip()
+            if v and v[0] in _SYMBOL_CURRENCY:
+                return _SYMBOL_CURRENCY[v[0]]
+    return None
+
+
 def _build_rows(df: pd.DataFrame, header_map: dict[str, tuple[str | None, str | None]],
                  platform_id: str, level: str,
                  brand_default_currency: str) -> tuple[list[dict], int, list[str], bool]:
@@ -78,14 +149,24 @@ def _build_rows(df: pd.DataFrame, header_map: dict[str, tuple[str | None, str | 
     paths. `header_map`: {raw_header: (canonical_field_or_None, captured_currency_or_None)}."""
     header_currency = next((c for _f, c in header_map.values() if c), None)
     explicit_currency_col = next((h for h, (f, _c) in header_map.items() if f == "currency"), None)
-    fallback_currency = header_currency or brand_default_currency
-    currency_assumed = not header_currency and not explicit_currency_col
+    symbol_currency = None if (header_currency or explicit_currency_col) else _detect_symbol_currency(df, header_map)
+    fallback_currency = header_currency or symbol_currency or brand_default_currency
+    currency_assumed = not header_currency and not explicit_currency_col and not symbol_currency
+
+    campaign_col = next((h for h, (f, _c) in header_map.items() if f == "campaign"), None)
+    has_date_col = any(f == "date" for f, _c in header_map.values())
 
     rows: list[dict] = []
     dropped = 0
     dates: list[str] = []
 
     for _, raw_row in df.iterrows():
+        if campaign_col is not None:
+            camp_val = raw_row.get(campaign_col)
+            if camp_val is not None and str(camp_val).strip().lower() in _AGGREGATE_ROW_NAMES:
+                dropped += 1  # a trailing summary row ("Total"), not a real campaign
+                continue
+
         canon: dict = {f: None for f in mapping.CANONICAL_FIELDS}
         row_currency = None
         for raw_h, (canon_field, _captured) in header_map.items():
@@ -105,20 +186,32 @@ def _build_rows(df: pd.DataFrame, header_map: dict[str, tuple[str | None, str | 
         canon["level"] = level
         canon["platform"] = platform_id
 
-        if not canon["date"] or canon["campaign"] in (None, ""):
+        # A row missing its date is only a real parse failure when a date
+        # column actually exists — a whole-period summary export (no daily
+        # breakdown at all) legitimately has no date on any row, and the
+        # caller fills one in afterward rather than every row being dropped.
+        if (has_date_col and not canon["date"]) or canon["campaign"] in (None, ""):
             dropped += 1
             continue
 
         rows.append(canon)
-        dates.append(canon["date"])
+        if canon["date"]:
+            dates.append(canon["date"])
 
-    return rows, dropped, dates, currency_assumed
+    needs_period_date = (not has_date_col) and len(rows) > 0
+    return rows, dropped, dates, currency_assumed, needs_period_date
 
 
 def _finalize(rows, dropped, dates, currency_assumed, unmapped, filename,
               platform_id, platform_label, detection_scores, level,
-              brand_default_currency) -> NormalizeResult:
+              brand_default_currency, needs_period_date=False) -> NormalizeResult:
     warnings: list[str] = []
+    if needs_period_date:
+        warnings.append(
+            f"'{filename}' has no date column — it looks like a whole-period summary "
+            "(one row per campaign, totals for the period), not a daily breakdown. "
+            "Pick the date range this file covers before importing."
+        )
     if unmapped:
         warnings.append(
             f"{len(unmapped)} column(s) weren't recognized and were left out: "
@@ -140,6 +233,7 @@ def _finalize(rows, dropped, dates, currency_assumed, unmapped, filename,
         currency=(rows[0]["currency"] if rows else None), currency_assumed=currency_assumed,
         date_start=min(dates) if dates else None, date_end=max(dates) if dates else None,
         row_count=len(rows), dropped_row_count=dropped, warnings=warnings, status=status,
+        needs_period_date=needs_period_date,
     )
 
 
@@ -166,11 +260,12 @@ def normalize_upload(df: pd.DataFrame, filename: str,
     header_map = mapping.map_headers(profile, headers)
     unmapped = [h for h in headers if h not in header_map]
 
-    rows, dropped, dates, currency_assumed = _build_rows(
+    rows, dropped, dates, currency_assumed, needs_period_date = _build_rows(
         df, header_map, profile.id, level, brand_default_currency
     )
     return _finalize(rows, dropped, dates, currency_assumed, unmapped, filename,
-                      profile.id, profile.label, scores, level, brand_default_currency)
+                      profile.id, profile.label, scores, level, brand_default_currency,
+                      needs_period_date)
 
 
 def normalize_manual_mapping(df: pd.DataFrame, filename: str, brand_default_currency: str,
@@ -203,8 +298,9 @@ def normalize_manual_mapping(df: pd.DataFrame, filename: str, brand_default_curr
     }
     unmapped = [h for h, choice in column_choices.items() if choice == "ignore"]
 
-    rows, dropped, dates, currency_assumed = _build_rows(
+    rows, dropped, dates, currency_assumed, needs_period_date = _build_rows(
         df, header_map, "generic", level, brand_default_currency
     )
     return _finalize(rows, dropped, dates, currency_assumed, unmapped, filename,
-                      "generic", platform_label, {}, level, brand_default_currency)
+                      "generic", platform_label, {}, level, brand_default_currency,
+                      needs_period_date)

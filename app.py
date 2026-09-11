@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
+from io import StringIO
 
 import altair as alt
 import pandas as pd
@@ -140,87 +141,124 @@ with tab_import:
 
     if uploaded:
         for f in uploaded:
-            st.markdown(f"---\n**{f.name}**")
+            # Some real-world exports (a custom reporting-tool CSV, not a raw
+            # platform-UI export) stack multiple tables in one file — see
+            # normalize.split_multi_table_csv. XLSX files are read as a single
+            # table; no evidence yet that xlsx exports have this shape.
             try:
                 if f.name.lower().endswith(".csv"):
-                    raw_df = pd.read_csv(f)
+                    raw_text = f.read().decode("utf-8-sig")
+                    blocks = normalize.split_multi_table_csv(raw_text)
+                    sub_frames = [
+                        (f"{f.name} — table {i+1}" if len(blocks) > 1 else f.name, pd.read_csv(StringIO(b)))
+                        for i, b in enumerate(blocks)
+                    ]
                 else:
-                    raw_df = pd.read_excel(f)
+                    sub_frames = [(f.name, pd.read_excel(f))]
             except Exception as e:
+                st.markdown(f"---\n**{f.name}**")
                 st.error(f"Couldn't read this file at all: {e}")
                 continue
 
-            result = normalize.normalize_upload(raw_df, f.name, brand["currency"])
+            for sub_name, raw_df in sub_frames:
+                key = sub_name  # unique per file+table, used to namespace widget keys below
+                st.markdown(f"---\n**{sub_name}**")
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Detected platform", result.platform_label)
-            c2.metric("Report level", result.level)
-            c3.metric("Rows parsed", result.row_count)
-            c4.metric("Date range", f"{result.date_start or '—'} → {result.date_end or '—'}")
+                result = normalize.normalize_upload(raw_df, sub_name, brand["currency"])
 
-            with st.expander("Detection confidence (why this platform?)"):
-                st.json(result.detection_scores)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Detected platform", result.platform_label)
+                c2.metric("Report level", result.level)
+                c3.metric("Rows parsed", result.row_count)
+                c4.metric("Date range", f"{result.date_start or '—'} → {result.date_end or '—'}")
 
-            for w in result.warnings:
-                st.warning(w)
+                with st.expander("Detection confidence (why this platform?)"):
+                    st.json(result.detection_scores)
 
-            if result.status == "failed" and result.platform_id is None:
-                st.error("Couldn't auto-detect the platform for this file.")
-                with st.expander(f"Map columns manually — {f.name}", expanded=True):
-                    st.caption("Generic CSV fallback: assign each column yourself. "
-                               "Required: date, campaign, spend.")
-                    cols = list(raw_df.columns)
-                    platform_label = st.text_input("Platform / source name", value="Generic export", key=f"plabel_{f.name}")
-                    level_choice = st.selectbox("Report level", LEVELS, key=f"level_{f.name}")
-                    choices = {}
-                    grid = st.columns(2)
-                    for i, col in enumerate(cols):
-                        with grid[i % 2]:
-                            choices[col] = st.selectbox(
-                                col, ["ignore"] + MAPPABLE_FIELDS,
-                                index=(["ignore"] + MAPPABLE_FIELDS).index(_guess_field(col)),
-                                key=f"map_{f.name}_{col}",
+                for w in result.warnings:
+                    st.warning(w)
+
+                if result.status == "failed" and result.platform_id is None:
+                    st.error("Couldn't auto-detect the platform for this table.")
+                    with st.expander(f"Map columns manually — {sub_name}", expanded=True):
+                        st.caption("Generic CSV fallback: assign each column yourself. "
+                                   "Required: date, campaign, spend.")
+                        cols = list(raw_df.columns)
+                        platform_label = st.text_input("Platform / source name", value="Generic export", key=f"plabel_{key}")
+                        level_choice = st.selectbox("Report level", LEVELS, key=f"level_{key}")
+                        choices = {}
+                        grid = st.columns(2)
+                        for i, col in enumerate(cols):
+                            with grid[i % 2]:
+                                choices[col] = st.selectbox(
+                                    col, ["ignore"] + MAPPABLE_FIELDS,
+                                    index=(["ignore"] + MAPPABLE_FIELDS).index(_guess_field(col)),
+                                    key=f"map_{key}_{col}",
+                                )
+                        if st.button(f"Import with this mapping — {sub_name}", key=f"manual_import_{key}"):
+                            m_result = normalize.normalize_manual_mapping(
+                                raw_df, sub_name, brand["currency"], choices, level_choice, platform_label
                             )
-                    if st.button(f"Import with this mapping — {f.name}", key=f"manual_import_{f.name}"):
-                        m_result = normalize.normalize_manual_mapping(
-                            raw_df, f.name, brand["currency"], choices, level_choice, platform_label
+                            for w in m_result.warnings:
+                                st.warning(w)
+                            if m_result.status == "failed":
+                                st.error("Still can't import — fix the required-field mapping above.")
+                            else:
+                                import_id = db.create_import(
+                                    brand_id=brand_id, platform=m_result.platform_id, level=m_result.level,
+                                    filename=sub_name, date_start=m_result.date_start, date_end=m_result.date_end,
+                                    row_count=m_result.row_count, status=m_result.status,
+                                    unmapped_columns=m_result.unmapped_columns,
+                                    notes="manual mapping: " + "; ".join(m_result.warnings),
+                                )
+                                db.insert_rows(import_id, brand_id, m_result.rows)
+                                st.success(f"Imported {m_result.row_count} rows as '{platform_label}'.")
+                                st.rerun()
+                    continue
+
+                rows_to_import = result.rows
+                period_start = period_end = None
+                if result.needs_period_date:
+                    st.info("This table has no date column — pick the period it covers. "
+                            "Every row will be recorded on the period's end date (daily "
+                            "trend won't be available for this import, only period totals).")
+                    default_end = date.today()
+                    period_range = st.date_input(
+                        "Period covered by this table", (default_end.replace(day=1), default_end),
+                        key=f"period_{key}",
+                    )
+                    if len(period_range) == 2:
+                        period_start, period_end = period_range
+                        rows_to_import = [{**r, "date": str(period_end)} for r in result.rows]
+                    else:
+                        st.caption("Pick both a start and end date to continue.")
+
+                confirm_disabled = result.needs_period_date and period_end is None
+                date_start_for_import = str(period_start) if period_start else result.date_start
+                date_end_for_import = str(period_end) if period_end else result.date_end
+
+                if not confirm_disabled:
+                    overlaps = db.find_overlapping_import(
+                        brand_id, result.platform_id, date_start_for_import, date_end_for_import
+                    )
+                    if overlaps:
+                        st.warning(
+                            f"This date range overlaps {len(overlaps)} existing import(s) for "
+                            f"{result.platform_label} already on file. Importing again will add "
+                            f"duplicate rows unless you delete the old import first (Settings tab)."
                         )
-                        for w in m_result.warnings:
-                            st.warning(w)
-                        if m_result.status == "failed":
-                            st.error("Still can't import — fix the required-field mapping above.")
-                        else:
-                            import_id = db.create_import(
-                                brand_id=brand_id, platform=m_result.platform_id, level=m_result.level,
-                                filename=f.name, date_start=m_result.date_start, date_end=m_result.date_end,
-                                row_count=m_result.row_count, status=m_result.status,
-                                unmapped_columns=m_result.unmapped_columns,
-                                notes="manual mapping: " + "; ".join(m_result.warnings),
-                            )
-                            db.insert_rows(import_id, brand_id, m_result.rows)
-                            st.success(f"Imported {m_result.row_count} rows as '{platform_label}'.")
-                            st.rerun()
-                continue
 
-            overlaps = db.find_overlapping_import(brand_id, result.platform_id, result.date_start, result.date_end)
-            if overlaps:
-                st.warning(
-                    f"This date range overlaps {len(overlaps)} existing import(s) for "
-                    f"{result.platform_label} already on file. Importing again will add "
-                    f"duplicate rows unless you delete the old import first (Settings tab)."
-                )
-
-            if st.button(f"Confirm import — {f.name}", key=f"import_{f.name}"):
-                import_id = db.create_import(
-                    brand_id=brand_id, platform=result.platform_id, level=result.level,
-                    filename=f.name, date_start=result.date_start, date_end=result.date_end,
-                    row_count=result.row_count, status=result.status,
-                    unmapped_columns=result.unmapped_columns,
-                    notes="; ".join(result.warnings),
-                )
-                db.insert_rows(import_id, brand_id, result.rows)
-                st.success(f"Imported {result.row_count} rows.")
-                st.rerun()
+                if st.button(f"Confirm import — {sub_name}", key=f"import_{key}", disabled=confirm_disabled):
+                    import_id = db.create_import(
+                        brand_id=brand_id, platform=result.platform_id, level=result.level,
+                        filename=sub_name, date_start=date_start_for_import, date_end=date_end_for_import,
+                        row_count=len(rows_to_import), status=result.status,
+                        unmapped_columns=result.unmapped_columns,
+                        notes="; ".join(result.warnings),
+                    )
+                    db.insert_rows(import_id, brand_id, rows_to_import)
+                    st.success(f"Imported {len(rows_to_import)} rows.")
+                    st.rerun()
 
     st.markdown("---")
     st.caption("**Not built yet:** automatic API sync (Meta/Google/Microsoft Marketing APIs) — "

@@ -154,6 +154,7 @@ GOOGLE = PlatformProfile(
         "conversions": "conversions",
         "conv. value": "conversion_value",
         "all conv. value": "conversion_value",
+        "revenue": "conversion_value",
         "conversion action": "result_type",
     },
     regex_map=[],
