@@ -252,6 +252,23 @@ def delete_rows_in_range(brand_id: int, platform: str, date_start: str, date_end
             )
 
 
+def rename_campaign(brand_id: int, platform: str, old_name: str, new_name: str) -> int:
+    """Merges an old campaign name's historical rows under a new/canonical
+    name — for when the SAME real-world campaign got renamed in the ad
+    platform (a note added, a typo fixed) rather than actually replaced,
+    so trend/forecast/insights see one continuous campaign instead of two
+    unrelated ones. Scoped to one platform since the same shorthand can
+    legitimately exist on two different platforms. Returns rows affected.
+    Never called silently — the caller confirms with the viewer first."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE performance_rows SET campaign=%s WHERE brand_id=%s AND platform=%s AND campaign=%s",
+                (new_name, brand_id, platform, old_name),
+            )
+            return cur.rowcount
+
+
 def list_imports(brand_id: int | None = None) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:

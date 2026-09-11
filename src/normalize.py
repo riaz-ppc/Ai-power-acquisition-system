@@ -18,6 +18,7 @@ Two entry points:
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass, field
 
@@ -421,3 +422,101 @@ def data_completeness_suggestions(rows: list[dict], level: str, platform_id: str
         )
 
     return suggestions
+
+
+def _tokenize(s: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", s.lower()) if t]
+
+
+def _token_similarity(shorter_tokens: list[str], longer_tokens: list[str]) -> float:
+    """Each of the shorter name's tokens matched against its single best-
+    fitting token in the longer name, then averaged — asymmetric on
+    purpose: this asks "does the longer name explain every word of the
+    shorter one," which is what a rename-plus-note looks like, not
+    "are these two strings alike overall" (which false-positives on
+    short common words and misses a whole appended note dragging down
+    a naive average)."""
+    if not shorter_tokens or not longer_tokens:
+        return 0.0
+    total = sum(
+        max((difflib.SequenceMatcher(None, st, lt).ratio() for lt in longer_tokens), default=0.0)
+        for st in shorter_tokens
+    )
+    return total / len(shorter_tokens)
+
+
+def detect_campaign_renames(df: pd.DataFrame, min_similarity: float = 0.85,
+                             max_overlap_days: int = 3) -> list[dict]:
+    """
+    Flags pairs of campaign names within the same platform that are
+    probably the SAME campaign carried under a different literal string —
+    a short note appended when relaunching, pausing, or tweaking it
+    ("HSC PMX" -> "HSC PMX (relaunch march 4)") — rather than two
+    genuinely different campaigns, so a rename doesn't silently reset
+    that campaign's trend/forecast/decomposition history to zero.
+
+    Two signals, both required: (1) every token of the SHORTER name
+    matches well inside the LONGER name's tokens (>= min_similarity) —
+    catches an appended note without being thrown off by short common
+    words the way whole-string similarity would; (2) the two names'
+    active date spans in this data overlap by no more than
+    `max_overlap_days` — a real rename means the old name stops
+    appearing right around when the new one starts, not that both ran
+    side by side, which would mean they're genuinely different
+    concurrent campaigns that just happen to share wording.
+
+    Every result is a SUGGESTION for the viewer to confirm — nothing
+    here merges anything on its own.
+    """
+    if df.empty:
+        return []
+    spans = df.groupby(["platform", "campaign"], dropna=False).agg(
+        start=("date", "min"), end=("date", "max")
+    ).reset_index()
+
+    candidates = []
+    for platform, group in spans.groupby("platform"):
+        recs = group.to_dict("records")
+        for i in range(len(recs)):
+            for j in range(i + 1, len(recs)):
+                ra, rb = recs[i], recs[j]
+                a, b = ra["campaign"], rb["campaign"]
+                if not a or not b or a == b:
+                    continue
+                a_tokens, b_tokens = _tokenize(a), _tokenize(b)
+                if not a_tokens or not b_tokens or a_tokens == b_tokens:
+                    continue
+
+                if len(a_tokens) <= len(b_tokens):
+                    shorter_tokens, longer_tokens = a_tokens, b_tokens
+                    shorter_rec, longer_rec = ra, rb
+                else:
+                    shorter_tokens, longer_tokens = b_tokens, a_tokens
+                    shorter_rec, longer_rec = rb, ra
+
+                sim = _token_similarity(shorter_tokens, longer_tokens)
+                if sim < min_similarity:
+                    continue
+
+                s_start, s_end = pd.Timestamp(shorter_rec["start"]), pd.Timestamp(shorter_rec["end"])
+                l_start, l_end = pd.Timestamp(longer_rec["start"]), pd.Timestamp(longer_rec["end"])
+                overlap_start, overlap_end = max(s_start, l_start), min(s_end, l_end)
+                overlap_days = max(0, (overlap_end - overlap_start).days + 1)
+                if overlap_days > max_overlap_days:
+                    continue
+
+                if s_start <= l_start:
+                    old_rec, new_rec = shorter_rec, longer_rec
+                else:
+                    old_rec, new_rec = longer_rec, shorter_rec
+
+                candidates.append({
+                    "platform": platform,
+                    "old_name": old_rec["campaign"], "new_name": new_rec["campaign"],
+                    "similarity": round(float(sim), 2), "overlap_days": int(overlap_days),
+                    "old_range": (str(old_rec["start"]), str(old_rec["end"])),
+                    "new_range": (str(new_rec["start"]), str(new_rec["end"])),
+                })
+
+    candidates.sort(key=lambda c: -c["similarity"])
+    return candidates

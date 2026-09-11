@@ -1061,6 +1061,35 @@ with tab_export:
         st.caption("No imports yet.")
 
     st.markdown("---")
+    st.write("**Possible campaign renames**")
+    st.caption("A campaign renamed in the ad platform (a note added, a typo fixed) looks like a brand-new "
+               "campaign to this app unless the two are linked — that breaks trend/forecast/root-cause "
+               "history right at the rename. This checks for near-identical names whose active dates don't "
+               "overlap (a real rename: the old name stops right around when the new one starts) and "
+               "suggests merging them. Always a suggestion you confirm — nothing merges on its own.")
+    rename_check_rows = db.rows_for_brand(brand_id)
+    if not rename_check_rows:
+        st.caption("No data yet.")
+    else:
+        rename_df = metrics.rows_to_df(rename_check_rows)
+        renames = normalize.detect_campaign_renames(rename_df)
+        if not renames:
+            st.success("No likely renames detected in this brand's campaign history.")
+        else:
+            for i, r in enumerate(renames):
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{md_safe(r['old_name'])}** ({r['old_range'][0]} → {r['old_range'][1]}) "
+                        f"might be the same campaign as **{md_safe(r['new_name'])}** "
+                        f"({r['new_range'][0]} → {r['new_range'][1]}) on {r['platform']} — "
+                        f"{r['similarity']*100:.0f}% name match, {r['overlap_days']} day(s) overlap."
+                    )
+                    if st.button(f"Merge under '{r['new_name']}'", key=f"merge_rename_{i}"):
+                        n = db.rename_campaign(brand_id, r["platform"], r["old_name"], r["new_name"])
+                        st.success(f"Merged {n} row(s) — '{r['old_name']}' now reports as '{r['new_name']}'.")
+                        st.rerun()
+
+    st.markdown("---")
     st.write("**Export normalized data**")
     all_rows = db.rows_for_brand(brand_id)
     if all_rows:
