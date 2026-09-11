@@ -105,6 +105,34 @@ def split_multi_table_csv(raw_text: str) -> list[str]:
     return cleaned
 
 
+def strip_title_rows_df(raw_df: pd.DataFrame) -> pd.DataFrame | None:
+    """
+    The Excel-sheet equivalent of split_multi_table_csv's title-stripping —
+    for a sheet read with header=None (so title/subtitle rows land as data
+    instead of being wrongly treated as column names). Drops leading rows
+    that have at most one non-empty cell, then promotes the first row that
+    looks like a real header (more than one populated cell) to be the
+    DataFrame's columns. Returns None if the sheet never finds such a row
+    (e.g. a genuinely empty or single-column sheet).
+    """
+    df = raw_df.reset_index(drop=True)
+    while len(df) > 2:
+        first_row = df.iloc[0]
+        non_empty = first_row.notna() & (first_row.astype(str).str.strip() != "")
+        if non_empty.sum() <= 1:
+            df = df.iloc[1:].reset_index(drop=True)
+        else:
+            break
+    if len(df) < 2:
+        return None
+    header_row = df.iloc[0]
+    if (header_row.notna() & (header_row.astype(str).str.strip() != "")).sum() <= 1:
+        return None
+    result = df.iloc[1:].reset_index(drop=True)
+    result.columns = [str(c).strip() if pd.notna(c) else f"Unnamed_{i}" for i, c in enumerate(header_row)]
+    return result
+
+
 _MONEY_RE = re.compile(r"[^0-9.\-]")
 
 

@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import zipfile
 from datetime import date, timedelta
-from io import StringIO
+from io import BytesIO, StringIO
 
 import altair as alt
 import pandas as pd
@@ -40,6 +41,57 @@ def _guess_field(header: str) -> str:
         if any(k in h for k in keys):
             return field_name
     return "ignore"
+
+
+def _read_upload_to_frames(f) -> list[tuple[str, pd.DataFrame]]:
+    """
+    Turns one uploaded file into a list of (label, raw_dataframe) pairs —
+    almost always one, but can be several: a CSV that stacks multiple
+    tables (see normalize.split_multi_table_csv), an Excel workbook with
+    more than one sheet (a Google Sheet with separate Google/Bing tabs
+    exported as .xlsx would otherwise silently only read the first one),
+    or a .zip containing one or more CSVs — how a real Microsoft/Bing Ads
+    export actually arrived in practice, not a hypothetical.
+    """
+    name_lower = f.name.lower()
+
+    if name_lower.endswith(".zip"):
+        frames: list[tuple[str, pd.DataFrame]] = []
+        with zipfile.ZipFile(BytesIO(f.read())) as zf:
+            csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv") and "__MACOSX" not in n]
+            if not csv_names:
+                raise ValueError("This zip doesn't contain any .csv files.")
+            for entry_name in csv_names:
+                raw_text = zf.read(entry_name).decode("utf-8-sig", errors="replace")
+                blocks = normalize.split_multi_table_csv(raw_text)
+                for i, b in enumerate(blocks):
+                    label = f"{f.name}/{entry_name}" + (f" — table {i+1}" if len(blocks) > 1 else "")
+                    frames.append((label, pd.read_csv(StringIO(b))))
+        return frames
+
+    if name_lower.endswith(".csv"):
+        raw_text = f.read().decode("utf-8-sig")
+        blocks = normalize.split_multi_table_csv(raw_text)
+        return [
+            (f"{f.name} — table {i+1}" if len(blocks) > 1 else f.name, pd.read_csv(StringIO(b)))
+            for i, b in enumerate(blocks)
+        ]
+
+    # .xlsx / .xls — read every sheet, not just the default first one, and
+    # strip any title/subtitle rows the same way a stacked CSV needs to.
+    raw_sheets = pd.read_excel(f, sheet_name=None, header=None)
+    frames = []
+    multi_sheet = len(raw_sheets) > 1
+    for sheet_name, raw_df in raw_sheets.items():
+        cleaned = normalize.strip_title_rows_df(raw_df)
+        if cleaned is None or cleaned.empty:
+            continue
+        label = f"{f.name} — {sheet_name}" if multi_sheet else f.name
+        frames.append((label, cleaned))
+    if not frames:
+        raise ValueError("No usable sheet found in this workbook.")
+    return frames
+
 
 st.set_page_config(page_title="PPC Acquisition Intelligence", layout="wide")
 
@@ -163,27 +215,16 @@ tab_import, tab_dash, tab_insights, tab_tests, tab_recon, tab_export = st.tabs(
 
 with tab_import:
     st.subheader(f"Import PPC reports — {selected_name}")
-    st.caption("Meta Ads Manager, Google Ads, or Microsoft Ads exports (CSV/XLSX). "
-               "Platform and report level are auto-detected from the column headers.")
+    st.caption("Meta Ads Manager, Google Ads, or Microsoft Ads exports — CSV, XLSX (every sheet is checked, "
+               "not just the first), or a .zip containing CSVs. Platform, report level, and stacked/"
+               "multi-table files are all auto-detected from the column headers.")
 
-    uploaded = st.file_uploader("Drop export files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+    uploaded = st.file_uploader("Drop export files", type=["csv", "xlsx", "xls", "zip"], accept_multiple_files=True)
 
     if uploaded:
         for f in uploaded:
-            # Some real-world exports (a custom reporting-tool CSV, not a raw
-            # platform-UI export) stack multiple tables in one file — see
-            # normalize.split_multi_table_csv. XLSX files are read as a single
-            # table; no evidence yet that xlsx exports have this shape.
             try:
-                if f.name.lower().endswith(".csv"):
-                    raw_text = f.read().decode("utf-8-sig")
-                    blocks = normalize.split_multi_table_csv(raw_text)
-                    sub_frames = [
-                        (f"{f.name} — table {i+1}" if len(blocks) > 1 else f.name, pd.read_csv(StringIO(b)))
-                        for i, b in enumerate(blocks)
-                    ]
-                else:
-                    sub_frames = [(f.name, pd.read_excel(f))]
+                sub_frames = _read_upload_to_frames(f)
             except Exception as e:
                 st.markdown(f"---\n**{f.name}**")
                 st.error(f"Couldn't read this file at all: {e}")
