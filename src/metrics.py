@@ -228,6 +228,126 @@ def forecast_trend(daily: pd.DataFrame, metric: str, lookback_days: int = 14,
     }
 
 
+def campaign_marginal_efficiency(df: pd.DataFrame, campaign: str, business_model: str,
+                                  lookback_days: int = 60) -> dict | None:
+    """
+    A campaign's average CPA/ROAS so far can look fine while the campaign
+    is already past the point of diminishing returns — or look mediocre
+    while still on the way up. This fits a simple power-law response
+    curve (value ~ a * spend^b — the standard simplified shape for a
+    diminishing-returns media response, not a novel model) to the
+    campaign's own daily spend/value history, and reads the marginal
+    cost/value of the NEXT dollar off the fitted elasticity `b`:
+    b < 1 means diminishing returns (the margin is worse than the
+    average so far); b > 1 means still scaling well (the margin is
+    better than average).
+
+    Deliberately returns None — rather than a number the data can't
+    support — when: there's under 8 days of real spend+value in the
+    lookback window; day-to-day spend barely varies (coefficient of
+    variation < 0.15, i.e. nothing to fit a slope against); the fitted
+    line explains under 30% of the variance (r_squared < 0.3); or, for
+    a CPA campaign, the fitted elasticity is at or below zero (spend
+    increases aren't tracking with conversions at all — inverting that
+    into a "marginal CPA" would be nonsense, though a flat/negative
+    elasticity is itself worth knowing and shows up via r_squared/None).
+    """
+    if df.empty:
+        return None
+    value_col = "conversion_value" if business_model == "transactional" else "conversions"
+    end = df["date"].max()
+    start = end - pd.Timedelta(days=lookback_days)
+    camp_df = df[(df["campaign"] == campaign) & (df["date"] >= start) & (df["date"] <= end)]
+    daily = camp_df.groupby("date", dropna=False).agg(spend=("spend", "sum"), value=(value_col, "sum")).reset_index()
+    daily = daily[(daily["spend"] > 0) & (daily["value"] > 0)]
+    if len(daily) < 8:
+        return None
+
+    spend = daily["spend"].to_numpy(dtype=float)
+    value = daily["value"].to_numpy(dtype=float)
+    cv = spend.std() / spend.mean() if spend.mean() else 0.0
+    if cv < 0.15:
+        return None
+
+    log_spend, log_value = np.log(spend), np.log(value)
+    b, log_a = np.polyfit(log_spend, log_value, 1)
+    fitted = log_a + b * log_spend
+    ss_res = np.sum((log_value - fitted) ** 2)
+    ss_tot = np.sum((log_value - log_value.mean()) ** 2)
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+    if r_squared < 0.3:
+        return None
+
+    avg_spend, avg_value = spend.mean(), value.mean()
+    if business_model == "transactional":
+        avg_metric = avg_value / avg_spend  # average ROAS
+        marginal_metric = avg_metric * b    # marginal revenue per $ = b * avg ROAS
+    else:
+        if b <= 0:
+            return None
+        avg_metric = avg_spend / avg_value  # average CPA
+        marginal_metric = avg_metric / b    # marginal cost per conversion
+
+    return {
+        "elasticity": round(float(b), 3),
+        "r_squared": round(float(r_squared), 3),
+        "avg_metric": float(avg_metric),
+        "marginal_metric": float(marginal_metric),
+        "days_used": int(len(daily)),
+    }
+
+
+def budget_reallocation_view(df: pd.DataFrame, camp_agg: pd.DataFrame, brand,
+                              min_spend_share: float = 0.05, lookback_days: int = 60) -> list[dict]:
+    """
+    Ranks this period's campaigns (excluding trivial ones under
+    `min_spend_share` of total spend, to keep noise out) by the best
+    available read on where the NEXT dollar is efficient: a marginal
+    estimate from campaign_marginal_efficiency() when the campaign's own
+    history supports one, falling back to plain average CPA/ROAS —
+    clearly labeled as such — when it doesn't. This is the basis for a
+    reallocation suggestion, not a guaranteed-optimal budget split: it
+    says which campaigns are worth a real look, not exactly how many
+    pounds/taka to move.
+    """
+    if camp_agg.empty:
+        return []
+    total_spend = camp_agg["spend"].sum()
+    if not total_spend:
+        return []
+    is_transactional = brand["business_model"] == "transactional"
+    target = brand.get("target_roas") if is_transactional else brand.get("target_cpa")
+
+    rows = []
+    for _, r in camp_agg.iterrows():
+        if r["spend"] < total_spend * min_spend_share:
+            continue
+        marginal = campaign_marginal_efficiency(df, r["campaign"], brand["business_model"], lookback_days)
+        avg_metric = r.get("roas") if is_transactional else r.get("cpa")
+        ranking_metric = marginal["marginal_metric"] if marginal else avg_metric
+        efficient_at_target = None
+        if target and ranking_metric is not None:
+            efficient_at_target = (ranking_metric >= target) if is_transactional else (ranking_metric <= target)
+        rows.append({
+            "campaign": r["campaign"], "spend": float(r["spend"]),
+            "avg_metric": float(avg_metric) if avg_metric is not None else None,
+            "marginal_metric": marginal["marginal_metric"] if marginal else None,
+            "elasticity": marginal["elasticity"] if marginal else None,
+            "r_squared": marginal["r_squared"] if marginal else None,
+            "basis": "marginal" if marginal else "average (not enough spend variation/history for a marginal estimate)",
+            "ranking_metric": float(ranking_metric) if ranking_metric is not None else None,
+            "efficient_at_target": efficient_at_target,
+        })
+
+    def _sort_key(row):
+        if row["ranking_metric"] is None:
+            return float("inf")
+        return -row["ranking_metric"] if is_transactional else row["ranking_metric"]
+
+    rows.sort(key=_sort_key)
+    return rows
+
+
 # Static commercial-calendar knowledge, keyed by the brand's own market
 # (its "country") and, where relevant, its business model. This is
 # deliberately NOT a live trends feed — nothing here is fetched or

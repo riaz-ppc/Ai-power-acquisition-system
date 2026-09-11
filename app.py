@@ -707,6 +707,49 @@ with tab_insights:
                         f"({fl['pct_change']:+.0f}% day-over-day, z={fl['z_score']}, threshold=±{fl['threshold']})"
                     )
 
+        st.markdown("---")
+        st.markdown("#### Budget reallocation")
+        st.caption("A campaign's average CPA/ROAS so far can look fine while it's already past the point "
+                   "of diminishing returns — or look mediocre while still scaling well. Where a campaign's "
+                   "own spend history varies enough to fit a response curve, this reads the MARGINAL cost/"
+                   "value of the next pound/taka there, not just the average of what's already been spent. "
+                   "Campaigns under 5% of this period's spend are skipped as too small to read reliably.")
+        realloc_metric = "roas" if brand["business_model"] == "transactional" else "cpa"
+        realloc = metrics.budget_reallocation_view(df, camp_agg, brand)
+        if not realloc:
+            st.info("No campaign in this period has enough spend share to rank.")
+        else:
+            fmt_realloc = (lambda v: money(v, brand["currency"])) if realloc_metric == "cpa" else ratio
+            realloc_table = pd.DataFrame([{
+                "Campaign": r["campaign"],
+                "Spend": money(r["spend"], brand["currency"]),
+                f"Avg {realloc_metric.upper()}": fmt_realloc(r["avg_metric"]) if r["avg_metric"] is not None else "—",
+                f"Marginal {realloc_metric.upper()}": fmt_realloc(r["marginal_metric"]) if r["marginal_metric"] is not None else "—",
+                "Basis": "marginal (curve fit)" if r["marginal_metric"] is not None else "average only",
+                "Fit R²": r["r_squared"] if r["r_squared"] is not None else "—",
+            } for r in realloc])
+            st.dataframe(realloc_table, hide_index=True, use_container_width=True)
+
+            best, worst = realloc[0], realloc[-1]
+            if (best["ranking_metric"] is not None and worst["ranking_metric"] is not None
+                    and best["campaign"] != worst["campaign"]):
+                gap_pct = abs(worst["ranking_metric"] - best["ranking_metric"]) / abs(best["ranking_metric"]) * 100 \
+                    if best["ranking_metric"] else 0
+                if gap_pct >= 25:
+                    test_amount = worst["spend"] * 0.15
+                    st.warning(
+                        f"**{best['campaign']}** looks like the more efficient place for the next pound/taka "
+                        f"right now ({best['basis']}: {fmt_realloc(best['ranking_metric'])}) vs. "
+                        f"**{worst['campaign']}** ({worst['basis']}: {fmt_realloc(worst['ranking_metric'])}) — "
+                        f"a {gap_pct:.0f}% gap. Worth testing a shift of roughly "
+                        f"{money(test_amount, brand['currency'])} (~15% of {worst['campaign']}'s spend this "
+                        f"period) from {worst['campaign']} to {best['campaign']} and watching what happens — "
+                        f"this is a suggested test size, not a guaranteed-optimal split."
+                    )
+                else:
+                    st.success(f"No large efficiency gap between campaigns this period (best vs. worst "
+                               f"differ by {gap_pct:.0f}%) — nothing worth disrupting budgets over yet.")
+
 # ------------------------------------------------------------------ tests --
 
 with tab_tests:
