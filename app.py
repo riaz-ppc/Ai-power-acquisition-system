@@ -6,15 +6,18 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO, StringIO
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from streamlit_cookies_manager import CookieManager
 
 from src import db, mapping, metrics, normalize, orders, report
 
@@ -96,27 +99,85 @@ def _read_upload_to_frames(f) -> list[tuple[str, pd.DataFrame]]:
 st.set_page_config(page_title="PPC Acquisition Intelligence", layout="wide")
 
 
+# No prefix on the CookieManager (see _log_out's comment on why) — this
+# name just needs to be distinctive enough not to collide with anything
+# else on this app's own domain.
+AUTH_COOKIE_NAME = "ppc_intelligence_auth_token"
+AUTH_COOKIE_TTL_DAYS = 30
+
+
+def _auth_token(password: str) -> str:
+    # Keyed by the real password so the token is only ever valid for
+    # whatever APP_PASSWORD currently is — the cookie carries this
+    # derived token, never the password itself, so a stolen cookie can't
+    # be turned back into the password, and rotating APP_PASSWORD
+    # invalidates every outstanding cookie automatically.
+    return hmac.new(password.encode(), b"ppc-intelligence-auth-v1", hashlib.sha256).hexdigest()
+
+
 def _check_password() -> bool:
     """Gate the whole app behind a single shared password, set via the
     APP_PASSWORD environment variable on the deployment (Render, not this
     repo — never hardcoded, never committed). Local dev with no
     APP_PASSWORD set stays open, so this never gets in the way of running
-    it on your own machine. Session-scoped: each browser session that
-    enters the correct password stays authenticated for that session only."""
+    it on your own machine.
+
+    st.session_state alone doesn't survive a browser reload — Streamlit
+    opens a brand-new session on every page reload, which is why the
+    password used to be asked for every time. A signed cookie (holding
+    only an HMAC token derived from the password, not the password
+    itself) extends that across reloads for AUTH_COOKIE_TTL_DAYS."""
     required = os.environ.get("APP_PASSWORD")
     if not required:
         return True
     if st.session_state.get("authenticated"):
         return True
+
+    cookies = CookieManager()
+    if not cookies.ready():
+        st.stop()
+    cookies._default_expiry = datetime.now() + timedelta(days=AUTH_COOKIE_TTL_DAYS)
+
+    if cookies.get(AUTH_COOKIE_NAME) == _auth_token(required):
+        st.session_state["authenticated"] = True
+        return True
+
     st.title("PPC Intelligence")
     pw = st.text_input("Password", type="password", key="pw_input")
     if pw:
         if pw == required:
             st.session_state["authenticated"] = True
-            st.rerun()
+            cookies[AUTH_COOKIE_NAME] = _auth_token(required)
+            # Deliberately no st.rerun() here: the cookie write is a
+            # component render that still needs to reach the browser and
+            # actually run its JS (document.cookie = ...) — an immediate
+            # rerun tears that component down first, so the cookie never
+            # lands. Falling through and letting this same run continue
+            # (the caller proceeds past _check_password() normally) gives
+            # it that chance; the next real reload then finds the cookie.
+            cookies.save()
+            return True
         else:
             st.error("Incorrect password.")
     return False
+
+
+def _log_out():
+    # Same reasoning as the login path: no st.rerun() right after
+    # cookies.save() here either, or the delete-cookie component gets
+    # torn down before its JS actually runs, the cookie survives, and
+    # the very next run's cookie check silently logs the same browser
+    # straight back in. Rendering a message and st.stop()-ing in THIS
+    # run gives the delete a chance to really happen; the next reload
+    # (manual, since there's nothing left running to auto-rerun into)
+    # then genuinely finds no valid cookie.
+    cookies = CookieManager()
+    if cookies.ready() and AUTH_COOKIE_NAME in cookies:
+        del cookies[AUTH_COOKIE_NAME]
+        cookies.save()
+    st.session_state["authenticated"] = False
+    st.info("Logged out. Reload the page to sign in again.")
+    st.stop()
 
 
 if not _check_password():
@@ -168,6 +229,8 @@ def brand_dict(row) -> dict:
 # --------------------------------------------------------------- sidebar --
 
 st.sidebar.title("PPC Intelligence")
+if os.environ.get("APP_PASSWORD") and st.sidebar.button("Log out"):
+    _log_out()
 brands = db.list_brands()
 brand_names = {b["name"]: b["id"] for b in brands}
 
