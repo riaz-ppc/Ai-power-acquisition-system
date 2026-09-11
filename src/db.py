@@ -81,6 +81,20 @@ CREATE TABLE IF NOT EXISTS tests (
     ended_at TEXT,
     status TEXT NOT NULL DEFAULT 'running'  -- running / concluded
 );
+
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL REFERENCES imports(id),
+    brand_id INTEGER NOT NULL REFERENCES brands(id),
+    order_date TEXT NOT NULL,
+    order_id TEXT,
+    amount REAL NOT NULL,
+    raw_campaign TEXT,
+    matched_campaign TEXT,          -- confirmed by the viewer, never auto-trusted
+    source TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_orders_brand_date ON orders(brand_id, order_date);
 """
 
 
@@ -272,3 +286,47 @@ def list_tests(brand_id: int) -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM tests WHERE brand_id=? ORDER BY started_at DESC", (brand_id,)
         ).fetchall()
+
+
+# ----------------------------------------------------------------- orders --
+
+def insert_orders(import_id: int, brand_id: int, rows: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT INTO orders (import_id, brand_id, order_date, order_id, amount, raw_campaign, source)
+               VALUES (:import_id, :brand_id, :order_date, :order_id, :amount, :campaign, :source)""",
+            [{**r, "import_id": import_id, "brand_id": brand_id} for r in rows],
+        )
+
+
+def orders_for_brand(brand_id: int, start: str | None = None, end: str | None = None) -> list[sqlite3.Row]:
+    q = "SELECT * FROM orders WHERE brand_id=?"
+    params: list = [brand_id]
+    if start:
+        q += " AND order_date >= ?"
+        params.append(start)
+    if end:
+        q += " AND order_date <= ?"
+        params.append(end)
+    with get_conn() as conn:
+        return conn.execute(q, params).fetchall()
+
+
+def unmatched_raw_campaigns(brand_id: int) -> list[str]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT raw_campaign FROM orders WHERE brand_id=? AND matched_campaign IS NULL AND raw_campaign IS NOT NULL",
+            (brand_id,),
+        ).fetchall()
+        return [r["raw_campaign"] for r in rows]
+
+
+def set_campaign_matches(brand_id: int, matches: dict[str, str | None]):
+    """matches: {raw_campaign: matched_campaign_or_None}. None (or 'ignore')
+    is stored as the literal string so it isn't re-suggested every time."""
+    with get_conn() as conn:
+        for raw, matched in matches.items():
+            conn.execute(
+                "UPDATE orders SET matched_campaign=? WHERE brand_id=? AND raw_campaign=?",
+                (matched or "ignore", brand_id, raw),
+            )

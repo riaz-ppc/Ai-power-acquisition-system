@@ -14,7 +14,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from src import db, mapping, metrics, normalize, report
+from src import db, mapping, metrics, normalize, orders, report
 
 MAPPABLE_FIELDS = [f for f in mapping.CANONICAL_FIELDS if f != "level"]
 LEVELS = ["campaign", "ad_set", "ad", "keyword"]
@@ -126,8 +126,8 @@ st.sidebar.caption(
     f"conversion = {brand['conversion_type']}"
 )
 
-tab_import, tab_dash, tab_insights, tab_tests, tab_export = st.tabs(
-    ["📥 Import", "📊 Dashboard", "🧭 Insights", "🧪 A/B Tests", "⚙️ Settings & Export"]
+tab_import, tab_dash, tab_insights, tab_tests, tab_recon, tab_export = st.tabs(
+    ["📥 Import", "📊 Dashboard", "🧭 Insights", "🧪 A/B Tests", "💷 Reconciliation", "⚙️ Settings & Export"]
 )
 
 # ---------------------------------------------------------------- import --
@@ -479,6 +479,130 @@ with tab_tests:
                     st.caption("⚠️ Sample size under 30 clicks on at least one side — treat this read cautiously.")
             else:
                 st.caption("No matching campaign data yet for this test's variants.")
+
+# -------------------------------------------------------- reconciliation --
+
+with tab_recon:
+    st.subheader(f"Revenue reconciliation — {selected_name}")
+    st.caption("Cross-check actual order revenue against what each platform claims as conversion value. "
+               "Platforms attribute from their own pixel, which can overstate (or understate) real revenue — "
+               "this is the ground-truth check.")
+
+    st.markdown("#### Import actual orders")
+    order_files = st.file_uploader("Drop an order/sales export (needs a date and an amount column)",
+                                    type=["csv"], accept_multiple_files=True, key="order_uploader")
+    if order_files:
+        for f in order_files:
+            st.markdown(f"---\n**{f.name}**")
+            try:
+                raw_text = f.read().decode("utf-8-sig")
+                blocks = normalize.split_multi_table_csv(raw_text)
+                block_df = pd.read_csv(StringIO(blocks[0]))
+            except Exception as e:
+                st.error(f"Couldn't read this file: {e}")
+                continue
+
+            if not orders.looks_like_order_sheet(list(block_df.columns)):
+                st.warning("This doesn't look like an order sheet (needs a date column and an amount "
+                           "column, and no ad-metric columns like spend/impressions/clicks). Skipped.")
+                continue
+
+            o_result = orders.normalize_orders(block_df, f.name)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Rows parsed", o_result.row_count)
+            c2.metric("Date range", f"{o_result.date_start or '—'} → {o_result.date_end or '—'}")
+            c3.metric("Total amount", money(sum(r["amount"] for r in o_result.rows), brand["currency"]) if o_result.rows else "—")
+            for w in o_result.warnings:
+                st.warning(w)
+
+            if o_result.rows and st.button(f"Import orders — {f.name}", key=f"order_import_{f.name}"):
+                import_id = db.create_import(
+                    brand_id=brand_id, platform="orders", level="order", filename=f.name,
+                    date_start=o_result.date_start, date_end=o_result.date_end,
+                    row_count=o_result.row_count, status=o_result.status,
+                    unmapped_columns=o_result.unmapped_columns,
+                )
+                db.insert_orders(import_id, brand_id, o_result.rows)
+                st.success(f"Imported {o_result.row_count} orders.")
+                st.rerun()
+
+    all_orders = db.orders_for_brand(brand_id)
+    if not all_orders:
+        st.info("No orders imported yet — drop an order/sales export above to get started.")
+    else:
+        st.markdown("---")
+        st.markdown("#### Match campaign names")
+        st.caption("Order sheets use shorthand campaign names that rarely match the platform's exact "
+                   "names exactly. Every suggestion below is a guess — confirm or correct each one; "
+                   "nothing is used for reconciliation until you save.")
+
+        unmatched = db.unmatched_raw_campaigns(brand_id)
+        perf_rows = db.rows_for_brand(brand_id)
+        campaigns_by_platform: dict[str, list[str]] = {}
+        for r in perf_rows:
+            campaigns_by_platform.setdefault(r["platform"], [])
+            if r["campaign"] and r["campaign"] not in campaigns_by_platform[r["platform"]]:
+                campaigns_by_platform[r["platform"]].append(r["campaign"])
+        all_known_campaigns = sorted({c for cs in campaigns_by_platform.values() for c in cs})
+
+        if not all_known_campaigns:
+            st.info("No campaign performance data imported yet for this brand — import that first "
+                    "(Import tab) so there's something to match orders against.")
+        elif not unmatched:
+            st.success("All order campaigns are matched.")
+        else:
+            order_rows_by_campaign: dict[str, str | None] = {}
+            for o in all_orders:
+                if o["raw_campaign"] and o["raw_campaign"] not in order_rows_by_campaign:
+                    order_rows_by_campaign[o["raw_campaign"]] = o["source"]
+
+            with st.form("campaign_matches"):
+                choices = {}
+                options = ["ignore"] + all_known_campaigns
+                for raw in unmatched:
+                    source = order_rows_by_campaign.get(raw)
+                    platform_hint = orders.SOURCE_TO_PLATFORM.get((source or "").lower())
+                    scoped = campaigns_by_platform.get(platform_hint, []) if platform_hint else all_known_campaigns
+                    suggestion = orders.suggest_campaign_matches(
+                        [raw], {platform_hint: scoped} if platform_hint else campaigns_by_platform
+                    )[raw]
+                    default_idx = options.index(suggestion) if suggestion in options else 0
+                    label = f"{raw}" + (f"  (source: {source})" if source else "")
+                    choices[raw] = st.selectbox(label, options, index=default_idx, key=f"match_{raw}")
+                if st.form_submit_button("Save matches"):
+                    db.set_campaign_matches(brand_id, choices)
+                    st.success("Saved.")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### Reconciliation")
+        odf = pd.DataFrame([dict(o) for o in all_orders])
+        odf = odf[~odf["matched_campaign"].isin([None, "ignore"])]
+        if odf.empty:
+            st.info("No matched orders yet to reconcile — match campaigns above first.")
+        else:
+            order_totals = odf.groupby("matched_campaign")["amount"].sum().rename("actual_revenue")
+            perf_df = metrics.rows_to_df(perf_rows)
+            claimed_totals = metrics.aggregate(perf_df, by=["campaign"])[["campaign", "conversion_value"]].set_index("campaign")["conversion_value"].rename("platform_claimed")
+
+            recon = pd.concat([order_totals, claimed_totals], axis=1).fillna(0.0).reset_index()
+            recon.columns = ["campaign", "actual_revenue", "platform_claimed"]
+            recon["delta"] = recon["actual_revenue"] - recon["platform_claimed"]
+            recon["delta_pct"] = (recon["delta"] / recon["platform_claimed"].replace(0, pd.NA)) * 100
+            recon = recon.sort_values("actual_revenue", ascending=False)
+
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Actual revenue (orders)", money(recon["actual_revenue"].sum(), brand["currency"]))
+            t2.metric("Platform-claimed revenue", money(recon["platform_claimed"].sum(), brand["currency"]))
+            total_delta_pct = (recon["actual_revenue"].sum() - recon["platform_claimed"].sum()) / recon["platform_claimed"].sum() * 100 if recon["platform_claimed"].sum() else None
+            t3.metric("Overall difference", pct(total_delta_pct))
+
+            st.dataframe(recon.style.format({
+                "actual_revenue": "{:,.2f}", "platform_claimed": "{:,.2f}",
+                "delta": "{:,.2f}", "delta_pct": "{:+.1f}%",
+            }), use_container_width=True)
+            st.caption("Positive delta = platforms under-claimed vs. real revenue. Negative = platforms "
+                       "over-claimed (common with pixel-based attribution).")
 
 # ------------------------------------------------------------- settings ---
 
