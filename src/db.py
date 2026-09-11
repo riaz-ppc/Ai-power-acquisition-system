@@ -7,11 +7,14 @@ purpose — no ORM — so moving to Postgres later is a driver swap plus a
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "ppc_intelligence.db"
+# DB_PATH env var lets a deployment point this at a mounted persistent disk
+# (e.g. Render) instead of the repo-relative default used for local dev.
+DB_PATH = Path(os.environ.get("DB_PATH") or (Path(__file__).resolve().parent.parent / "data" / "ppc_intelligence.db"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS brands (

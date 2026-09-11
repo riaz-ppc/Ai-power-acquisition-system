@@ -7,6 +7,7 @@ Run with:  streamlit run app.py
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, timedelta
 from io import StringIO
 
@@ -41,6 +42,34 @@ def _guess_field(header: str) -> str:
     return "ignore"
 
 st.set_page_config(page_title="PPC Acquisition Intelligence", layout="wide")
+
+
+def _check_password() -> bool:
+    """Gate the whole app behind a single shared password, set via the
+    APP_PASSWORD environment variable on the deployment (Render, not this
+    repo — never hardcoded, never committed). Local dev with no
+    APP_PASSWORD set stays open, so this never gets in the way of running
+    it on your own machine. Session-scoped: each browser session that
+    enters the correct password stays authenticated for that session only."""
+    required = os.environ.get("APP_PASSWORD")
+    if not required:
+        return True
+    if st.session_state.get("authenticated"):
+        return True
+    st.title("PPC Intelligence")
+    pw = st.text_input("Password", type="password", key="pw_input")
+    if pw:
+        if pw == required:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+
+if not _check_password():
+    st.stop()
+
 db.init_db()
 
 CURRENCIES = ["USD", "GBP", "BDT", "EUR"]
