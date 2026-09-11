@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS brands (
     target_roas REAL,
     target_cpa REAL,
     target_payback_days REAL,
+    country TEXT,                           -- primary market, for seasonal/market-calendar context
     created_at TEXT DEFAULT (now()::text)
 );
 
@@ -113,6 +114,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_brand_date ON orders(brand_id, order_date)
 -- Idempotent: columns added after a table already existed elsewhere don't
 -- need a separate migrations list in Postgres, IF NOT EXISTS covers it.
 ALTER TABLE performance_rows ADD COLUMN IF NOT EXISTS reach REAL;
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS country TEXT;
 """
 
 
@@ -144,7 +146,7 @@ def init_db():
 
 def create_brand(**kwargs) -> int:
     fields = ["name", "business_model", "conversion_type", "currency", "margin_pct",
-              "aov", "ltv", "target_roas", "target_cpa", "target_payback_days"]
+              "aov", "ltv", "target_roas", "target_cpa", "target_payback_days", "country"]
     cols = [f for f in fields if f in kwargs]
     placeholders = ",".join(["%s"] * len(cols))
     with get_conn() as conn:
@@ -158,7 +160,7 @@ def create_brand(**kwargs) -> int:
 
 def update_brand(brand_id: int, **kwargs):
     fields = ["business_model", "conversion_type", "currency", "margin_pct",
-              "aov", "ltv", "target_roas", "target_cpa", "target_payback_days"]
+              "aov", "ltv", "target_roas", "target_cpa", "target_payback_days", "country"]
     cols = [f for f in fields if f in kwargs]
     if not cols:
         return

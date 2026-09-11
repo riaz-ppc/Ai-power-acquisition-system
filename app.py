@@ -125,6 +125,15 @@ if not _check_password():
 db.init_db()
 
 CURRENCIES = ["USD", "GBP", "BDT", "EUR"]
+# Markets with a stocked seasonal-calendar entry in metrics.market_seasons();
+# "Other" is still a valid brand location, it just won't get seasonal context yet.
+COUNTRIES = ["Bangladesh", "United Kingdom", "Other"]
+# Currency alone identifies the market for every currency actually in use here
+# (BDT is Bangladesh-only business, GBP is UK-only business) — no separate
+# location field needed at brand-creation time. USD/EUR are genuinely
+# ambiguous across countries, so they're left unset; set the market manually
+# in Settings for a brand using one of those if seasonal context is wanted.
+CURRENCY_TO_COUNTRY = {"BDT": "Bangladesh", "GBP": "United Kingdom"}
 
 
 # --------------------------------------------------------------- helpers --
@@ -169,7 +178,11 @@ with st.sidebar.expander("+ New brand", expanded=(len(brands) == 0)):
                                        help="transactional = e-commerce (ROAS/AOV); lead_gen = leads/enrollments (CPA)")
         conversion_type = st.text_input("Conversion type label", value="purchase" if business_model == "transactional" else "lead",
                                          help="e.g. purchase, lead, enrollment")
-        currency = st.selectbox("Primary currency", CURRENCIES)
+        currency = st.selectbox("Primary currency", CURRENCIES,
+                                 help="Also identifies this brand's market (BDT → Bangladesh, GBP → United "
+                                      "Kingdom) to surface known seasonal demand shifts — Eid, back-to-school, "
+                                      "Black Friday, etc. — in the Insights tab. For USD/EUR, set the market "
+                                      "manually in Settings after creating the brand, if wanted.")
         col1, col2 = st.columns(2)
         with col1:
             margin_pct = st.number_input("Contribution margin (%)", 0.0, 100.0, 40.0) / 100
@@ -187,7 +200,8 @@ with st.sidebar.expander("+ New brand", expanded=(len(brands) == 0)):
             else:
                 db.create_brand(
                     name=name.strip(), business_model=business_model, conversion_type=conversion_type,
-                    currency=currency, margin_pct=margin_pct or None, aov=aov or None,
+                    currency=currency, country=CURRENCY_TO_COUNTRY.get(currency),
+                    margin_pct=margin_pct or None, aov=aov or None,
                     ltv=ltv or None, target_roas=target_roas, target_cpa=target_cpa,
                     target_payback_days=target_payback_days or None,
                 )
@@ -569,6 +583,46 @@ with tab_insights:
                                f"({fmt_val(target_val)}) — worth acting before it gets there, not after.")
 
         st.markdown("---")
+        st.markdown("#### Market context")
+        if not brand.get("country"):
+            st.info("Add this brand's location/market in the Settings tab to unlock seasonal demand context here.")
+        else:
+            st.caption("A static calendar of known recurring demand periods for this brand's market — "
+                       "not a live trends feed — cross-checked against this brand's own history for the "
+                       "same window last year, where it has any.")
+            seasons = metrics.market_seasons(brand["country"], brand["business_model"], date.today())
+            if not seasons:
+                st.success(f"No known seasonal demand shift for {brand['country']} in the surrounding 30 days.")
+            else:
+                season_metric = "roas" if brand["business_model"] == "transactional" else "cpa"
+                for season in seasons:
+                    with st.container(border=True):
+                        icon = "📈" if season["direction"] == "up" else "📉"
+                        active = season["start"] <= date.today() <= season["end"]
+                        status = " · currently active" if active else (" · upcoming" if season["start"] > date.today() else " · recently ended")
+                        st.markdown(f"{icon} **{season['name']}** — {season['start'].isoformat()} to {season['end'].isoformat()}{status}")
+                        st.caption(season["note"])
+                        last_year_start = season["start"].replace(year=season["start"].year - 1)
+                        last_year_end = season["end"].replace(year=season["end"].year - 1)
+                        this_year_end = min(season["end"], date.today())
+                        if season["start"] <= date.today():
+                            season_cmp = metrics.compare_periods(df, season["start"], this_year_end, last_year_start, last_year_end)
+                            if season_cmp["baseline"]["spend"]:
+                                cval, bval = season_cmp["current"][season_metric], season_cmp["baseline"][season_metric]
+                                fmt = (lambda v: money(v, brand["currency"])) if season_metric == "cpa" else ratio
+                                st.write(f"So far this window: {season_metric.upper()} "
+                                         f"{fmt(cval) if cval is not None else '—'} vs. {fmt(bval) if bval is not None else '—'} "
+                                         f"in the same window last year.")
+                            else:
+                                st.caption("No data from this brand for the same window last year yet — nothing to compare against.")
+                        else:
+                            last_year_cmp = metrics.compare_periods(df, last_year_start, last_year_end, last_year_start, last_year_end)
+                            lval = last_year_cmp["current"][season_metric]
+                            if last_year_cmp["current"]["spend"] and lval is not None:
+                                fmt_val = money(lval, brand["currency"]) if season_metric == "cpa" else ratio(lval)
+                                st.caption(f"Last year during this window, {season_metric.upper()} was {fmt_val} — a reference point, not a prediction.")
+
+        st.markdown("---")
         st.markdown("#### Anomalies")
         st.caption("Days where the day-over-day change is a statistical outlier vs. this series' own "
                    "volatility (z-score ≥ 2), not just an arbitrary percent move.")
@@ -795,6 +849,10 @@ with tab_export:
 
     with st.form("edit_brand"):
         st.write("**Targets & unit-economics assumptions**")
+        country_options = COUNTRIES if brand.get("country") in COUNTRIES else [brand.get("country") or "Other"] + COUNTRIES
+        country = st.selectbox("Location / primary market", country_options,
+                                index=country_options.index(brand.get("country")) if brand.get("country") in country_options else 0,
+                                help="Used to surface known seasonal demand shifts for this market in the Insights tab.")
         col1, col2 = st.columns(2)
         with col1:
             margin_pct = st.number_input("Contribution margin (%)", 0.0, 100.0, (brand["margin_pct"] or 0.0) * 100) / 100
@@ -805,7 +863,7 @@ with tab_export:
             target_cpa = st.number_input("Target CPA", 0.0, value=brand["target_cpa"] or 0.0)
             target_payback_days = st.number_input("Target payback (days)", 0.0, value=brand["target_payback_days"] or 0.0)
         if st.form_submit_button("Save targets"):
-            db.update_brand(brand_id, margin_pct=margin_pct or None, aov=aov or None, ltv=ltv or None,
+            db.update_brand(brand_id, country=country, margin_pct=margin_pct or None, aov=aov or None, ltv=ltv or None,
                              target_roas=target_roas or None, target_cpa=target_cpa or None,
                              target_payback_days=target_payback_days or None)
             st.success("Saved.")

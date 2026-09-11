@@ -228,6 +228,84 @@ def forecast_trend(daily: pd.DataFrame, metric: str, lookback_days: int = 14,
     }
 
 
+# Static commercial-calendar knowledge, keyed by the brand's own market
+# (its "country") and, where relevant, its business model. This is
+# deliberately NOT a live trends feed — nothing here is fetched or
+# predicted, it's well-known recurring demand periods (moon-sighting
+# events are approximate, +/- a day). The honest use of it is as a
+# heads-up plus a same-window-last-year comparison against the brand's
+# own historical data, not a claim about "what will happen this year."
+# Lunar-calendar dates (Eid) are only stocked for a few years; a season
+# outside that range is simply not surfaced rather than guessed.
+_LUNAR_EVENTS = {
+    "Eid al-Fitr": {2025: "2025-03-31", 2026: "2026-03-20", 2027: "2027-03-10"},
+    "Eid al-Adha": {2025: "2025-06-07", 2026: "2026-05-27", 2027: "2027-05-17"},
+}
+
+# (month, day, span_days, name, direction, business_models or None=all, note)
+_FIXED_EVENTS_BY_COUNTRY = {
+    "Bangladesh": [
+        (4, 14, 3, "Pohela Boishakh (Bengali New Year)", "up", None,
+         "Major retail/e-commerce sales occasion nationwide."),
+        (11, 25, 5, "Black Friday / Cyber Monday", "up", ["transactional"],
+         "Growing e-commerce discount season even outside its US origin."),
+        (12, 20, 12, "Year-end clearance season", "up", ["transactional"],
+         "Retailers commonly clear stock before the new year."),
+    ],
+    "United Kingdom": [
+        (1, 2, 30, "January enrollment/new-term surge", "up", ["lead_gen"],
+         "New-year resolutions and new academic/training terms lift lead volume for courses and certifications."),
+        (4, 1, 20, "New UK tax year (Apr 6) / compliance renewal window", "up", ["lead_gen"],
+         "Employers often renew mandatory compliance training around the new tax year."),
+        (9, 1, 20, "Back-to-school / new term", "up", ["lead_gen"],
+         "Training and enrollment demand typically rises alongside the academic calendar."),
+        (11, 25, 5, "Black Friday / Cyber Monday", "up", ["transactional"],
+         "Widely observed UK retail discount event."),
+        (12, 20, 15, "Christmas/New Year lull", "down", None,
+         "Both consumer spending attention and B2B training bookings typically dip."),
+    ],
+}
+
+
+def market_seasons(country: str | None, business_model: str, ref_date, window_days: int = 30) -> list[dict]:
+    """
+    Known recurring commercial/cultural demand periods for `country` whose
+    window falls within `window_days` of `ref_date` (today, in practice).
+    Each entry says its direction (up/down) and is filtered to business
+    models it actually applies to. Returns [] when `country` isn't set or
+    isn't in the static calendar yet, rather than guessing.
+    """
+    if not country or country not in _FIXED_EVENTS_BY_COUNTRY:
+        return []
+    ref_date = pd.Timestamp(ref_date).date()
+    window_start, window_end = ref_date - pd.Timedelta(days=window_days), ref_date + pd.Timedelta(days=window_days)
+    results = []
+    for year in (ref_date.year - 1, ref_date.year, ref_date.year + 1):
+        for month, day, span, name, direction, models, note in _FIXED_EVENTS_BY_COUNTRY[country]:
+            if models and business_model not in models:
+                continue
+            try:
+                start = pd.Timestamp(year=year, month=month, day=day).date()
+            except ValueError:
+                continue
+            end = start + pd.Timedelta(days=span)
+            if start <= window_end and end >= window_start:
+                results.append({"name": name, "start": start, "end": end, "direction": direction, "note": note})
+    for name, years in _LUNAR_EVENTS.items():
+        for year in (ref_date.year - 1, ref_date.year, ref_date.year + 1):
+            if year not in years:
+                continue
+            start = pd.Timestamp(years[year]).date()
+            end = start + pd.Timedelta(days=3)
+            if start <= window_end and end >= window_start:
+                results.append({
+                    "name": name, "start": start, "end": end, "direction": "up",
+                    "note": "Major gift/retail spending occasion (Bangladesh); approximate date, moon-sighting dependent."
+                    if country == "Bangladesh" else "Moon-sighting dependent; date is approximate.",
+                })
+    return sorted(results, key=lambda r: r["start"])
+
+
 def creative_fatigue_candidates(ad_level_df: pd.DataFrame, min_periods: int = 3) -> list[dict]:
     """
     Per ad: prefer the real signal — frequency (impressions ÷ reach) climbing
