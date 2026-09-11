@@ -389,6 +389,10 @@ with tab_import:
                             if m_result.status == "failed":
                                 st.error("Still can't import — fix the required-field mapping above.")
                             else:
+                                for tip in normalize.data_completeness_suggestions(
+                                    m_result.rows, m_result.level, m_result.platform_id, brand["business_model"]
+                                ):
+                                    st.info(f"💡 {tip}")
                                 import_id = db.create_import(
                                     brand_id=brand_id, platform=m_result.platform_id, level=m_result.level,
                                     filename=sub_name, date_start=m_result.date_start, date_end=m_result.date_end,
@@ -400,6 +404,14 @@ with tab_import:
                                 st.success(f"Imported {m_result.row_count} rows as '{platform_label}'.")
                                 st.rerun()
                     continue
+
+                completeness_tips = normalize.data_completeness_suggestions(
+                    result.rows, result.level, result.platform_id, brand["business_model"]
+                )
+                if completeness_tips:
+                    with st.expander(f"💡 {len(completeness_tips)} tip(s) for a more complete report"):
+                        for tip in completeness_tips:
+                            st.caption(f"• {tip}")
 
                 rows_to_import = result.rows
                 period_start = period_end = None

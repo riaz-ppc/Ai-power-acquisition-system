@@ -342,3 +342,82 @@ def normalize_manual_mapping(df: pd.DataFrame, filename: str, brand_default_curr
     return _finalize(rows, dropped, dates, currency_assumed, unmapped, filename,
                       "generic", platform_label, {}, level, brand_default_currency,
                       needs_period_date)
+
+
+def data_completeness_suggestions(rows: list[dict], level: str, platform_id: str | None,
+                                   business_model: str) -> list[str]:
+    """
+    Not a validation gate — these are plain-language suggestions for
+    what would make THIS import (or the next one) more useful to the
+    rest of the app, checked against what the rows actually contain
+    rather than assumed. Only speaks up when a check finds something
+    concrete and missing; returns [] rather than padding out a list for
+    the sake of having something to say.
+    """
+    if not rows:
+        return []
+    suggestions: list[str] = []
+
+    dates = {r["date"] for r in rows if r.get("date")}
+    n_days = len(dates)
+    if n_days < 14:
+        suggestions.append(
+            f"Only {n_days} distinct day(s) of data here — trend forecasting and anomaly "
+            f"detection need at least 5 days to say anything at all, and get noticeably more "
+            f"reliable with 14+. More history (or importing more files) sharpens both."
+        )
+    if n_days >= 2:
+        span_start, span_end = min(dates), max(dates)
+        expected_days = (pd.Timestamp(span_end) - pd.Timestamp(span_start)).days + 1
+        if expected_days > n_days:
+            missing = expected_days - n_days
+            suggestions.append(
+                f"{missing} day(s) between {span_start} and {span_end} have no rows at all — "
+                f"gaps like this can distort day-over-day trend and anomaly reads, which assume "
+                f"one row per day."
+            )
+
+    if business_model == "transactional":
+        has_value = any((r.get("conversion_value") or 0) > 0 for r in rows)
+        if not has_value:
+            suggestions.append(
+                "No revenue/conversion-value data in this file — ROAS-based insights, the "
+                "break-even (iROAS) check, and budget reallocation all need it to say anything "
+                "for this brand. Include a 'conversion value' / 'purchase value' column if your "
+                "export tool offers one."
+            )
+
+    if platform_id == "meta" and level == "ad":
+        has_reach = any(r.get("reach") for r in rows)
+        if not has_reach:
+            suggestions.append(
+                "No 'Reach' column — creative fatigue detection falls back to a weaker CTR-only "
+                "signal instead of the more reliable frequency-based one (impressions ÷ reach). "
+                "Meta Ads Manager can add Reach as an export column."
+            )
+
+    if level == "campaign":
+        if platform_id in ("google", "microsoft"):
+            suggestions.append(
+                "This is a campaign-level export — a keyword-level export would let a future "
+                "keyword-waste check flag specific keywords burning spend with no conversions, "
+                "not just the campaign as a whole."
+            )
+        elif platform_id == "meta":
+            suggestions.append(
+                "This is a campaign-level export — an ad-level export would let creative fatigue "
+                "detection identify which specific ad is fading, not just the campaign."
+            )
+
+    zero_signal = sum(
+        1 for r in rows
+        if (r.get("spend") or 0) > 0 and not (r.get("impressions") or 0)
+        and not (r.get("clicks") or 0) and not (r.get("conversions") or 0)
+    )
+    if zero_signal:
+        suggestions.append(
+            f"{zero_signal} row(s) have spend recorded but no impressions, clicks, or "
+            f"conversions at all — worth checking whether this export left those columns out."
+        )
+
+    return suggestions
