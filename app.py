@@ -976,26 +976,44 @@ with tab_recon:
             else:
                 order_totals = odf.groupby("matched_campaign")["amount"].sum().rename("actual_revenue")
                 perf_df = metrics.rows_to_df(perf_rows)
-                claimed_totals = metrics.aggregate(perf_df, by=["campaign"])[["campaign", "conversion_value"]].set_index("campaign")["conversion_value"].rename("platform_claimed")
+                camp_perf = metrics.aggregate(perf_df, by=["campaign"]).set_index("campaign")
+                claimed_totals = camp_perf["conversion_value"].rename("platform_claimed")
+                spend_totals = camp_perf["spend"].rename("spend")
 
-                recon = pd.concat([order_totals, claimed_totals], axis=1).fillna(0.0).reset_index()
-                recon.columns = ["campaign", "actual_revenue", "platform_claimed"]
+                recon = pd.concat([order_totals, claimed_totals, spend_totals], axis=1).fillna(0.0).reset_index()
+                recon.columns = ["campaign", "actual_revenue", "platform_claimed", "spend"]
                 recon["delta"] = recon["actual_revenue"] - recon["platform_claimed"]
                 recon["delta_pct"] = (recon["delta"] / recon["platform_claimed"].replace(0, pd.NA)) * 100
+                # The ad platform's own "conversion value" is often just genuinely absent for
+                # lead-gen accounts (Google/Bing don't assign a monetary value to a lead unless
+                # that's separately configured) — spend is real regardless, so merging your own
+                # order revenue against it gives a true ROI even when platform_claimed is 0,
+                # which a lead-gen brand's CPA-based insights elsewhere in this app don't compute.
+                recon["true_roas"] = (recon["actual_revenue"] / recon["spend"]).where(recon["spend"] > 0)
+                recon["platform_roas"] = (recon["platform_claimed"] / recon["spend"]).where(recon["spend"] > 0)
                 recon = recon.sort_values("actual_revenue", ascending=False)
 
-                t1, t2, t3 = st.columns(3)
+                t1, t2, t3, t4 = st.columns(4)
                 t1.metric("Actual revenue (orders)", money(recon["actual_revenue"].sum(), brand["currency"]))
                 t2.metric("Platform-claimed revenue", money(recon["platform_claimed"].sum(), brand["currency"]))
                 total_delta_pct = (recon["actual_revenue"].sum() - recon["platform_claimed"].sum()) / recon["platform_claimed"].sum() * 100 if recon["platform_claimed"].sum() else None
-                t3.metric("Overall difference", pct(total_delta_pct))
+                t3.metric("Revenue difference", pct(total_delta_pct))
+                total_spend = recon["spend"].sum()
+                t4.metric("True ROI (actual revenue ÷ spend)",
+                          ratio(recon["actual_revenue"].sum() / total_spend) if total_spend else "—",
+                          help="Your own order revenue against real spend — works even for lead-gen "
+                               "brands, where the platform never tracked a conversion value at all.")
 
                 st.dataframe(recon.style.format({
-                    "actual_revenue": "{:,.2f}", "platform_claimed": "{:,.2f}",
+                    "actual_revenue": "{:,.2f}", "platform_claimed": "{:,.2f}", "spend": "{:,.2f}",
                     "delta": "{:,.2f}", "delta_pct": "{:+.1f}%",
+                    "true_roas": lambda v: ratio(v), "platform_roas": lambda v: ratio(v),
                 }), use_container_width=True)
-                st.caption("Positive delta = platforms under-claimed vs. real revenue. Negative = platforms "
-                           "over-claimed (common with pixel-based attribution).")
+                st.caption("delta/delta_pct: positive = platforms under-claimed vs. real revenue, negative = "
+                           "platforms over-claimed (common with pixel-based attribution). true_roas: this "
+                           "campaign's actual order revenue ÷ its spend — the honest ROI figure regardless of "
+                           "whether the platform tracks conversion value at all. platform_roas: what the "
+                           "platform's own claimed conversion value would imply, for comparison.")
 
 # ------------------------------------------------------------- settings ---
 
