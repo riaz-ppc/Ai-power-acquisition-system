@@ -226,6 +226,37 @@ def brand_dict(row) -> dict:
     return dict(row) if row is not None else {}
 
 
+_DRIVER_LABELS = {
+    "cpm": "CPM (cost per 1,000 impressions)", "ctr": "CTR (click-through rate)",
+    "cvr": "CVR (conversion rate)", "aov": "AOV (average order value)",
+}
+
+
+def _format_driver_value(key, v, ccy):
+    if key in ("cpm", "aov"):
+        return money(v, ccy)
+    return f"{v * 100:.2f}%"
+
+
+def _format_decomposition(decomp: dict, business_model: str, ccy: str) -> str:
+    """Turns metrics.decompose_metric_change()'s output into one plain
+    sentence naming the primary driver and, briefly, the others."""
+    metric_name = "ROAS" if business_model == "transactional" else "CPA"
+    verb = "worsened" if decomp["primary_driver_worsened_metric"] else "improved"
+    primary = decomp["primary_driver"]
+    p = decomp["drivers"][primary]
+    text = (f"**Why:** mainly **{_DRIVER_LABELS[primary]}** — "
+            f"{_format_driver_value(primary, p['baseline'], ccy)} → {_format_driver_value(primary, p['current'], ccy)} "
+            f"({p['pct_change']:+.0f}%), which {verb} {metric_name} and accounts for "
+            f"~{decomp['primary_driver_share_pct']:.0f}% of this move.")
+    others = [k for k in decomp["drivers"] if k != primary]
+    if others:
+        bits = [f"{_DRIVER_LABELS[k].split(' (')[0]} {_format_driver_value(k, decomp['drivers'][k]['baseline'], ccy)} "
+                f"→ {_format_driver_value(k, decomp['drivers'][k]['current'], ccy)}" for k in others]
+        text += " Other drivers barely moved: " + "; ".join(bits) + "."
+    return text
+
+
 # --------------------------------------------------------------- sidebar --
 
 st.sidebar.title("PPC Intelligence")
@@ -584,6 +615,12 @@ with tab_insights:
             with st.container(border=True):
                 st.markdown(f"{badge.get(ins.severity,'')} **{md_safe(ins.title)}**")
                 st.write(md_safe(ins.detail))
+                if ins.campaign:
+                    cur_totals = metrics.campaign_totals(df, ins.campaign, cur_start, cur_end)
+                    base_totals = metrics.campaign_totals(df, ins.campaign, base_start, base_end)
+                    decomp = metrics.decompose_metric_change(cur_totals, base_totals, brand["business_model"])
+                    if decomp:
+                        st.caption(md_safe(_format_decomposition(decomp, brand["business_model"], brand["currency"])))
                 if ins.suggested_action:
                     st.markdown(f"**→ Suggested action:** {md_safe(ins.suggested_action)}")
                 st.caption(f"metric: `{ins.metric}` · threshold: `{md_safe(ins.threshold)}` · formula: `{ins.formula}`")

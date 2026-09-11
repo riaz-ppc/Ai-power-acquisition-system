@@ -348,6 +348,84 @@ def budget_reallocation_view(df: pd.DataFrame, camp_agg: pd.DataFrame, brand,
     return rows
 
 
+def campaign_totals(df: pd.DataFrame, campaign: str, start, end) -> dict:
+    """Raw summed totals for one campaign over one date range — the plain
+    building block decompose_metric_change() compares two of."""
+    scoped = df[(df["campaign"] == campaign) & (df["date"] >= pd.Timestamp(start)) & (df["date"] <= pd.Timestamp(end))]
+    return {
+        "spend": float(scoped["spend"].sum()), "impressions": float(scoped["impressions"].sum()),
+        "clicks": float(scoped["clicks"].sum()), "conversions": float(scoped["conversions"].sum()),
+        "conversion_value": float(scoped["conversion_value"].sum()),
+    }
+
+
+def decompose_metric_change(current: dict, baseline: dict, business_model: str) -> dict | None:
+    """
+    An insight can say a campaign's CPA/ROAS broke a threshold, but not
+    WHY it moved — this decomposes the move into its funnel drivers
+    using an exact identity, not a fitted/approximate attribution:
+        CPA  = CPM ÷ (1000 × CTR × CVR)
+        ROAS = (CTR × CVR × AOV × 1000) ÷ CPM
+    (CPM = cost per 1,000 impressions, CTR = clicks/impressions,
+    CVR = conversions/clicks, AOV = conversion_value/conversions.) Each
+    driver's log-ratio (current vs. baseline) sums EXACTLY to the
+    metric's own log-ratio — every dollar of the change is accounted
+    for by one of these three (or four, for ROAS) numbers, nothing left
+    as an unexplained residual.
+
+    Returns None when either period has no real volume (zero
+    impressions, clicks, conversions, or spend) — there's nothing
+    honest to decompose from a period that didn't actually run.
+    """
+    def rates(totals):
+        imp, clk, conv, spend, value = (totals["impressions"], totals["clicks"],
+                                         totals["conversions"], totals["spend"], totals["conversion_value"])
+        if not imp or not clk or not conv or not spend:
+            return None
+        return {"cpm": spend / imp * 1000, "ctr": clk / imp, "cvr": conv / clk,
+                "aov": (value / conv) if conv else None}
+
+    cur, base = rates(current), rates(baseline)
+    if cur is None or base is None:
+        return None
+
+    driver_keys = ["cpm", "ctr", "cvr"] + (["aov"] if business_model == "transactional" else [])
+    drivers = {}
+    for key in driver_keys:
+        cv, bv = cur[key], base[key]
+        if not cv or not bv:
+            return None
+        drivers[key] = {"current": cv, "baseline": bv, "pct_change": (cv - bv) / bv * 100,
+                         "log_ratio": float(np.log(cv / bv))}
+
+    if business_model == "transactional":
+        # log(ROAS_ratio) = log(ctr) + log(cvr) + log(aov) - log(cpm); positive = ROAS improved
+        signed = {"ctr": 1, "cvr": 1, "aov": 1, "cpm": -1}
+    else:
+        # log(CPA_ratio) = log(cpm) - log(ctr) - log(cvr); positive = CPA worsened
+        signed = {"cpm": 1, "ctr": -1, "cvr": -1}
+
+    contributions = {k: signed[k] * drivers[k]["log_ratio"] for k in drivers}
+    metric_log_ratio = sum(contributions.values())
+    total_abs = sum(abs(v) for v in contributions.values()) or 1e-12
+    primary = max(contributions, key=lambda k: abs(contributions[k]))
+    # `signed` above defines metric_log_ratio as log(CPA_ratio) for lead_gen
+    # (positive = CPA rose = worse) but log(ROAS_ratio) for transactional
+    # (positive = ROAS rose = BETTER) — flip the read for transactional so
+    # "worsened" means the same real-world thing in both cases.
+    primary_pushed_worse = (contributions[primary] > 0) if business_model != "transactional" \
+        else (contributions[primary] < 0)
+
+    return {
+        "metric_pct_change": (float(np.exp(metric_log_ratio)) - 1) * 100,
+        "drivers": drivers,
+        "contribution_share_pct": {k: abs(v) / total_abs * 100 for k, v in contributions.items()},
+        "primary_driver": primary,
+        "primary_driver_share_pct": abs(contributions[primary]) / total_abs * 100,
+        "primary_driver_worsened_metric": primary_pushed_worse,
+    }
+
+
 # Static commercial-calendar knowledge, keyed by the brand's own market
 # (its "country") and, where relevant, its business model. This is
 # deliberately NOT a live trends feed — nothing here is fetched or
@@ -511,6 +589,8 @@ class Insight:
     threshold: str
     formula: str
     suggested_action: str = ""  # what to actually DO about it, not just what's wrong
+    campaign: str | None = None  # which campaign this is about, if any — lets a caller
+                                  # look up a root-cause decomposition without parsing `title`
 
 
 _CCY_SYMBOLS = {"USD": "$", "GBP": "£", "EUR": "€"}
@@ -547,6 +627,7 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
             if row["roas"] < iroas_floor:
                 insights.append(Insight(
                     severity="critical",
+                    campaign=camp,
                     title=f"{camp}: below break-even ROAS",
                     detail=(f"ROAS is {row['roas']:.2f}x against a break-even floor of "
                             f"{iroas_floor:.2f}x — this campaign is losing money on contribution "
@@ -560,6 +641,7 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
             elif target_roas and row["roas"] < target_roas:
                 insights.append(Insight(
                     severity="watch",
+                    campaign=camp,
                     title=f"{camp}: below target ROAS",
                     detail=f"ROAS is {row['roas']:.2f}x vs. a target of {target_roas:.2f}x.",
                     metric="roas", threshold=f"< {target_roas:.2f}x", formula="target_roas (brand config)",
@@ -569,6 +651,7 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
             elif target_roas and row["roas"] >= target_roas * 1.25:
                 insights.append(Insight(
                     severity="scale",
+                    campaign=camp,
                     title=f"{camp}: strong scale candidate",
                     detail=f"ROAS is {row['roas']:.2f}x, 25%+ above target ({target_roas:.2f}x).",
                     metric="roas", threshold=f">= {target_roas*1.25:.2f}x", formula="target_roas × 1.25",
@@ -581,6 +664,7 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
             if row["cpa"] > target_cpa * 1.15:
                 insights.append(Insight(
                     severity="critical",
+                    campaign=camp,
                     title=f"{camp}: CPA over target",
                     detail=(f"CPA is {_money(row['cpa'], ccy)} vs. a target of {_money(target_cpa, ccy)} "
                             f"(+15% tolerance breached)."),
@@ -592,6 +676,7 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
             elif row["cpa"] > target_cpa:
                 insights.append(Insight(
                     severity="watch",
+                    campaign=camp,
                     title=f"{camp}: CPA above target",
                     detail=f"CPA is {_money(row['cpa'], ccy)} vs. a target of {_money(target_cpa, ccy)}.",
                     metric="cpa", threshold=f"> {_money(target_cpa, ccy)}", formula="target_cpa (brand config)",
@@ -601,6 +686,7 @@ def generate_insights(campaign_agg: pd.DataFrame, brand, period_compare: dict | 
             elif row["cpa"] <= target_cpa * 0.8:
                 insights.append(Insight(
                     severity="scale",
+                    campaign=camp,
                     title=f"{camp}: efficient scale candidate",
                     detail=f"CPA is {_money(row['cpa'], ccy)}, 20%+ under target ({_money(target_cpa, ccy)}).",
                     metric="cpa", threshold=f"<= {_money(target_cpa*0.8, ccy)}", formula="target_cpa × 0.8",
