@@ -1,0 +1,23 @@
+# Copy this file to "meta-config.yaml" (same folder) and fill in every value.
+# NEVER commit or paste the filled-in file anywhere — it holds a live API
+# access token for your ad account.
+#
+# Where each value comes from:
+#   app_id / app_secret  -> developers.facebook.com > Your App > Settings > Basic
+#   access_token          -> a SYSTEM USER token (Business Settings > Users >
+#                             System Users > Generate Token), not a personal user
+#                             token — system user tokens don't expire on their
+#                             own, which matters for a scheduled sync. Grant it
+#                             "Ads Read" (or Admin) on the ad account below.
+#   ad_account_id          -> Ads Manager > Account overview, format act_XXXXXXXXXXXXX
+#   conversion_action_type -> which Meta "action_type" counts as THIS brand's
+#                             conversion (purchase / lead / enrollment...).
+#                             This varies per pixel/event setup — don't guess:
+#                             run `sync.py --list-action-types` first and pick
+#                             from what it actually finds on this account.
+
+app_id: "INSERT_APP_ID_HERE"
+app_secret: "INSERT_APP_SECRET_HERE"
+access_token: "INSERT_SYSTEM_USER_ACCESS_TOKEN_HERE"
+ad_account_id: "act_INSERT_AD_ACCOUNT_ID_HERE"
+conversion_action_type: "INSERT_ACTION_TYPE_HERE"

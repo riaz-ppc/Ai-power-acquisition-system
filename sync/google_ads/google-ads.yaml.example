@@ -1,0 +1,20 @@
+# Copy this file to "google-ads.yaml" (same folder) and fill in every value
+# below. NEVER commit or paste the filled-in file anywhere — it holds live
+# API credentials for your Google Ads account.
+#
+# Where each value comes from:
+#   developer_token     -> Google Ads UI > Tools & Settings > API Center
+#                           (apply for Basic access on your MANAGER account)
+#   client_id/secret    -> Google Cloud Console > APIs & Services > Credentials
+#                           (OAuth 2.0 Client ID, type "Desktop app")
+#   refresh_token       -> run generate_refresh_token.py in this folder once;
+#                           it prints this value for you to paste in here
+#   login_customer_id   -> your MANAGER (MCC) account id, digits only, no dashes
+#                           e.g. 1234567890 for 123-456-7890
+
+developer_token: "INSERT_DEVELOPER_TOKEN_HERE"
+client_id: "INSERT_OAUTH_CLIENT_ID_HERE"
+client_secret: "INSERT_OAUTH_CLIENT_SECRET_HERE"
+refresh_token: "INSERT_REFRESH_TOKEN_HERE"
+login_customer_id: "INSERT_MANAGER_CUSTOMER_ID_HERE"
+use_proto_plus: True
