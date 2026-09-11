@@ -195,11 +195,18 @@ with tab_import:
 
                 result = normalize.normalize_upload(raw_df, sub_name, brand["currency"])
 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Detected platform", result.platform_label)
-                c2.metric("Report level", result.level)
-                c3.metric("Rows parsed", result.row_count)
-                c4.metric("Date range", f"{result.date_start or '—'} → {result.date_end or '—'}")
+                # st.metric clips long text (a platform name, "campaign") in a
+                # narrow column — it's built for numbers. Plain text for the
+                # labels, a real metric only for the one number here.
+                info_col, rows_col = st.columns([3, 1])
+                with info_col:
+                    st.markdown(
+                        f"**Detected platform:** {result.platform_label}  \n"
+                        f"**Report level:** {result.level}  \n"
+                        f"**Date range:** {result.date_start or '—'} → {result.date_end or '—'}"
+                    )
+                with rows_col:
+                    st.metric("Rows parsed", result.row_count)
 
                 with st.expander("Detection confidence (why this platform?)"):
                     st.json(result.detection_scores)
@@ -537,9 +544,9 @@ with tab_recon:
                 continue
 
             o_result = orders.normalize_orders(block_df, f.name)
-            c1, c2, c3 = st.columns(3)
+            st.markdown(f"**Date range:** {o_result.date_start or '—'} → {o_result.date_end or '—'}")
+            c1, c3 = st.columns(2)
             c1.metric("Rows parsed", o_result.row_count)
-            c2.metric("Date range", f"{o_result.date_start or '—'} → {o_result.date_end or '—'}")
             c3.metric("Total amount", money(sum(r["amount"] for r in o_result.rows), brand["currency"]) if o_result.rows else "—")
             for w in o_result.warnings:
                 st.warning(w)
