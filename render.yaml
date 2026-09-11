@@ -1,3 +1,10 @@
+# Alternate deployment path — an always-on host (no sleep-on-inactivity,
+# unlike Streamlit Community Cloud's free tier), for later if that ever
+# matters. NOT the primary path: Streamlit Community Cloud is free;
+# Render's plans with enough memory for this app are not. Either way the
+# database is external (Supabase/Postgres, set via DATABASE_URL) — Render
+# itself holds no persistent disk here, since the app no longer keeps any
+# state on its own filesystem.
 services:
   - type: web
     name: ppc-intelligence
@@ -9,11 +16,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.10"
-      - key: DB_PATH
-        value: /data/ppc_intelligence.db
+      - key: DATABASE_URL
+        sync: false
       - key: APP_PASSWORD
         sync: false
-    disk:
-      name: ppc-intelligence-data
-      mountPath: /data
-      sizeGB: 1
