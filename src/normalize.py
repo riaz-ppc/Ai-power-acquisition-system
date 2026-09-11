@@ -65,10 +65,17 @@ def split_multi_table_csv(raw_text: str) -> list[str]:
         Campaign name,Clicks,Spend,...    <- a DIFFERENT table's header
         ...data rows...
 
-    Splits on blank-line-separated blocks and drops a leading title line —
-    detected as a line whose only non-empty cell is the first one — from
-    each block, leaving one clean CSV-text-per-table. A single ordinary
-    CSV (the common case) round-trips as a list of exactly one block.
+    Some also stack a SECOND single-cell line under the title — a plain-text
+    date range ("1 September 2026 - 7 September 2026") with no commas of its
+    own — and skip the blank-line separator entirely between title and
+    header. Both cases are handled the same way: any number of consecutive
+    single-cell leading lines are dropped, not just one, until a line that
+    actually looks like a header (more than one populated cell) is reached.
+
+    Splits on blank-line-separated blocks first, then strips those leading
+    single-cell lines from each block, leaving one clean CSV-text-per-table.
+    A single ordinary CSV (the common case) round-trips as one block, title
+    lines untouched, since its first line already has multiple cells.
     """
     lines = raw_text.splitlines()
     blocks: list[list[str]] = []
@@ -87,10 +94,13 @@ def split_multi_table_csv(raw_text: str) -> list[str]:
     for block in blocks:
         if len(block) < 2:
             continue  # a lone line (title with no table under it, stray blank) — not a table
-        first_cells = [c.strip() for c in block[0].split(",")]
-        non_empty = [c for c in first_cells if c]
-        if len(non_empty) == 1 and len(block) > 2:
-            block = block[1:]  # drop the lone title row
+        while len(block) > 2:
+            first_cells = [c.strip() for c in block[0].split(",")]
+            non_empty = [c for c in first_cells if c]
+            if len(non_empty) <= 1:
+                block = block[1:]  # drop a title/subtitle line, keep looking
+            else:
+                break  # this line has multiple populated cells — treat it as the real header
         cleaned.append("\n".join(block))
     return cleaned
 
@@ -129,7 +139,7 @@ def _to_iso_date(val) -> str | None:
 # so that default is a last resort, not a guess dressed up as detection.
 _SYMBOL_CURRENCY = {"£": "GBP", "€": "EUR", "$": "USD", "₹": "INR", "৳": "BDT"}
 
-_AGGREGATE_ROW_NAMES = {"total", "totals", "grand total", "sum"}
+_AGGREGATE_ROW_NAMES = {"total", "totals", "grand total", "sum", "-", "n/a"}
 
 
 def _detect_symbol_currency(df: pd.DataFrame, header_map: dict) -> str | None:

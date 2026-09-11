@@ -73,6 +73,20 @@ class PlatformProfile:
                 n += 1
         return n
 
+    _METRIC_FIELDS = {"spend", "impressions", "clicks", "conversions"}
+
+    def maps_a_metric(self, headers_norm: set[str]) -> bool:
+        """A genuine performance export has at least one actual metric column
+        (spend/impressions/clicks/conversions) — a file with only date and
+        campaign-name-shaped columns (an order log, a CRM export) can share
+        just enough vocabulary to clear MIN_COVERAGE without being one."""
+        for h in headers_norm:
+            if h in self.column_map and self.column_map[h] in self._METRIC_FIELDS:
+                return True
+            if any(re.match(pat, h) and f in self._METRIC_FIELDS for pat, f, _g in self.regex_map):
+                return True
+        return False
+
     def signal_score(self, headers_norm: set[str]) -> int:
         s = 0
         for sig in self.signals:
@@ -150,6 +164,7 @@ GOOGLE = PlatformProfile(
         "currency": "currency",
         "cost": "spend",
         "impressions": "impressions",
+        "impr.": "impressions",
         "clicks": "clicks",
         "conversions": "conversions",
         "conv. value": "conversion_value",
@@ -204,6 +219,11 @@ def detect_platform(headers: list[str]) -> tuple[Optional[PlatformProfile], dict
     scores = {p.id: p.score(headers_norm) for p in PLATFORMS}
     best = max(PLATFORMS, key=lambda p: scores[p.id])
     if best.coverage(headers_norm) < MIN_COVERAGE:
+        return None, scores
+    if not best.maps_a_metric(headers_norm):
+        # date + campaign-shaped columns alone aren't enough — a non-ad
+        # export (an order log, a CRM report) can share exactly that much
+        # vocabulary. Require a real performance metric before accepting.
         return None, scores
     return best, scores
 
