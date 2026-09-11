@@ -1,24 +1,35 @@
 """
-SQLite persistence for the prototype. Schema is plain relational SQL on
-purpose — no ORM — so moving to Postgres later is a driver swap plus a
-`CREATE TABLE` translation, not a rewrite.
+Postgres persistence (originally SQLite; migrated when the app moved to a
+hosted deployment that needed real persistent storage on a free tier —
+see the project's deployment notes). Schema is plain relational SQL on
+purpose — no ORM.
+
+Requires DATABASE_URL (a standard postgres:// or postgresql:// connection
+string — Supabase, Render Postgres, Neon, or a local Postgres all provide
+one the same way). Local dev picks it up from a .env file if present
+(never committed — see .gitignore); a hosted deployment sets it as a
+platform secret/environment variable. There is deliberately no silent
+fallback to a local file: a missing DATABASE_URL is a clear startup
+error, not a quietly different (and easy to lose track of) data store.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
 from contextlib import contextmanager
-from pathlib import Path
 
-# DB_PATH env var lets a deployment point this at a mounted persistent disk
-# (e.g. Render) instead of the repo-relative default used for local dev.
-DB_PATH = Path(os.environ.get("DB_PATH") or (Path(__file__).resolve().parent.parent / "data" / "ppc_intelligence.db"))
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
+
+load_dotenv()  # no-op if there's no local .env file (e.g. on a host that sets real env vars)
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS brands (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     business_model TEXT NOT NULL CHECK (business_model IN ('transactional','lead_gen')),
     conversion_type TEXT NOT NULL,          -- purchase / lead / enrollment / ...
@@ -29,16 +40,16 @@ CREATE TABLE IF NOT EXISTS brands (
     target_roas REAL,
     target_cpa REAL,
     target_payback_days REAL,
-    created_at TEXT DEFAULT (datetime('now'))
+    created_at TEXT DEFAULT (now()::text)
 );
 
 CREATE TABLE IF NOT EXISTS imports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     brand_id INTEGER NOT NULL REFERENCES brands(id),
     platform TEXT NOT NULL,
     level TEXT NOT NULL,
     filename TEXT NOT NULL,
-    imported_at TEXT DEFAULT (datetime('now')),
+    imported_at TEXT DEFAULT (now()::text),
     date_start TEXT,
     date_end TEXT,
     row_count INTEGER,
@@ -48,7 +59,7 @@ CREATE TABLE IF NOT EXISTS imports (
 );
 
 CREATE TABLE IF NOT EXISTS performance_rows (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     import_id INTEGER NOT NULL REFERENCES imports(id),
     brand_id INTEGER NOT NULL REFERENCES brands(id),
     date TEXT NOT NULL,
@@ -72,7 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_rows_brand_date ON performance_rows(brand_id, dat
 CREATE INDEX IF NOT EXISTS idx_rows_platform ON performance_rows(platform);
 
 CREATE TABLE IF NOT EXISTS tests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     brand_id INTEGER NOT NULL REFERENCES brands(id),
     name TEXT NOT NULL,
     hypothesis TEXT,
@@ -86,7 +97,7 @@ CREATE TABLE IF NOT EXISTS tests (
 );
 
 CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     import_id INTEGER NOT NULL REFERENCES imports(id),
     brand_id INTEGER NOT NULL REFERENCES brands(id),
     order_date TEXT NOT NULL,
@@ -98,42 +109,35 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_brand_date ON orders(brand_id, order_date);
+
+-- Idempotent: columns added after a table already existed elsewhere don't
+-- need a separate migrations list in Postgres, IF NOT EXISTS covers it.
+ALTER TABLE performance_rows ADD COLUMN IF NOT EXISTS reach REAL;
 """
 
 
 @contextmanager
 def get_conn():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL isn't set. Local dev: put it in a .env file in the project "
+            "root (never committed). Deployed: set it as a platform secret/env var."
+        )
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
-# Lightweight migrations for columns added after a table already existed on
-# disk — CREATE TABLE IF NOT EXISTS doesn't alter an existing table, so new
-# columns need an explicit, idempotent ADD COLUMN here.
-_MIGRATIONS = [
-    ("performance_rows", "reach", "ALTER TABLE performance_rows ADD COLUMN reach REAL"),
-]
-
-
 def init_db():
     with get_conn() as conn:
-        conn.executescript(SCHEMA)
-        existing_tables = {r["name"] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        for table, column, ddl in _MIGRATIONS:
-            if table not in existing_tables:
-                continue
-            cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            if column not in cols:
-                conn.execute(ddl)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA)
 
 
 # ---------------------------------------------------------------- brands --
@@ -142,13 +146,14 @@ def create_brand(**kwargs) -> int:
     fields = ["name", "business_model", "conversion_type", "currency", "margin_pct",
               "aov", "ltv", "target_roas", "target_cpa", "target_payback_days"]
     cols = [f for f in fields if f in kwargs]
-    placeholders = ",".join(["?"] * len(cols))
+    placeholders = ",".join(["%s"] * len(cols))
     with get_conn() as conn:
-        cur = conn.execute(
-            f"INSERT INTO brands ({','.join(cols)}) VALUES ({placeholders})",
-            [kwargs[c] for c in cols],
-        )
-        return cur.lastrowid
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO brands ({','.join(cols)}) VALUES ({placeholders}) RETURNING id",
+                [kwargs[c] for c in cols],
+            )
+            return cur.fetchone()["id"]
 
 
 def update_brand(brand_id: int, **kwargs):
@@ -157,53 +162,63 @@ def update_brand(brand_id: int, **kwargs):
     cols = [f for f in fields if f in kwargs]
     if not cols:
         return
-    set_clause = ",".join(f"{c}=?" for c in cols)
+    set_clause = ",".join(f"{c}=%s" for c in cols)
     with get_conn() as conn:
-        conn.execute(
-            f"UPDATE brands SET {set_clause} WHERE id=?",
-            [kwargs[c] for c in cols] + [brand_id],
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE brands SET {set_clause} WHERE id=%s",
+                [kwargs[c] for c in cols] + [brand_id],
+            )
 
 
-def list_brands() -> list[sqlite3.Row]:
+def list_brands() -> list[dict]:
     with get_conn() as conn:
-        return conn.execute("SELECT * FROM brands ORDER BY name").fetchall()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM brands ORDER BY name")
+            return cur.fetchall()
 
 
-def get_brand(brand_id: int) -> sqlite3.Row | None:
+def get_brand(brand_id: int) -> dict | None:
     with get_conn() as conn:
-        return conn.execute("SELECT * FROM brands WHERE id=?", (brand_id,)).fetchone()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM brands WHERE id=%s", (brand_id,))
+            return cur.fetchone()
 
 
-def get_brand_by_name(name: str) -> sqlite3.Row | None:
+def get_brand_by_name(name: str) -> dict | None:
     with get_conn() as conn:
-        return conn.execute("SELECT * FROM brands WHERE name=?", (name,)).fetchone()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM brands WHERE name=%s", (name,))
+            return cur.fetchone()
 
 
 # --------------------------------------------------------------- imports --
 
 def find_overlapping_import(brand_id: int, platform: str, date_start: str, date_end: str):
     with get_conn() as conn:
-        return conn.execute(
-            """SELECT * FROM imports
-               WHERE brand_id=? AND platform=?
-                 AND NOT (date_end < ? OR date_start > ?)""",
-            (brand_id, platform, date_start, date_end),
-        ).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT * FROM imports
+                   WHERE brand_id=%s AND platform=%s
+                     AND NOT (date_end < %s OR date_start > %s)""",
+                (brand_id, platform, date_start, date_end),
+            )
+            return cur.fetchall()
 
 
 def create_import(brand_id, platform, level, filename, date_start, date_end,
                    row_count, status, unmapped_columns: list[str], notes: str = "") -> int:
     with get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO imports
-               (brand_id, platform, level, filename, date_start, date_end,
-                row_count, status, unmapped_columns, notes)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (brand_id, platform, level, filename, date_start, date_end,
-             row_count, status, json.dumps(unmapped_columns), notes),
-        )
-        return cur.lastrowid
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO imports
+                   (brand_id, platform, level, filename, date_start, date_end,
+                    row_count, status, unmapped_columns, notes)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (brand_id, platform, level, filename, date_start, date_end,
+                 row_count, status, json.dumps(unmapped_columns), notes),
+            )
+            return cur.fetchone()["id"]
 
 
 def delete_import(import_id: int, brand_id: int) -> bool:
@@ -212,12 +227,14 @@ def delete_import(import_id: int, brand_id: int) -> bool:
     data. Returns False (nothing deleted) when the import doesn't belong
     to this brand."""
     with get_conn() as conn:
-        owner = conn.execute("SELECT brand_id FROM imports WHERE id=?", (import_id,)).fetchone()
-        if owner is None or owner["brand_id"] != brand_id:
-            return False
-        conn.execute("DELETE FROM performance_rows WHERE import_id=?", (import_id,))
-        conn.execute("DELETE FROM imports WHERE id=?", (import_id,))
-        return True
+        with conn.cursor() as cur:
+            cur.execute("SELECT brand_id FROM imports WHERE id=%s", (import_id,))
+            owner = cur.fetchone()
+            if owner is None or owner["brand_id"] != brand_id:
+                return False
+            cur.execute("DELETE FROM performance_rows WHERE import_id=%s", (import_id,))
+            cur.execute("DELETE FROM imports WHERE id=%s", (import_id,))
+            return True
 
 
 def delete_rows_in_range(brand_id: int, platform: str, date_start: str, date_end: str):
@@ -226,47 +243,57 @@ def delete_rows_in_range(brand_id: int, platform: str, date_start: str, date_end
     a few days after the fact), so it cleanly overwrites that window
     instead of accumulating duplicate rows like a one-off CSV import would."""
     with get_conn() as conn:
-        conn.execute(
-            "DELETE FROM performance_rows WHERE brand_id=? AND platform=? AND date>=? AND date<=?",
-            (brand_id, platform, date_start, date_end),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM performance_rows WHERE brand_id=%s AND platform=%s AND date>=%s AND date<=%s",
+                (brand_id, platform, date_start, date_end),
+            )
 
 
-def list_imports(brand_id: int | None = None) -> list[sqlite3.Row]:
+def list_imports(brand_id: int | None = None) -> list[dict]:
     with get_conn() as conn:
-        if brand_id:
-            return conn.execute(
-                "SELECT * FROM imports WHERE brand_id=? ORDER BY imported_at DESC",
-                (brand_id,),
-            ).fetchall()
-        return conn.execute("SELECT * FROM imports ORDER BY imported_at DESC").fetchall()
+        with conn.cursor() as cur:
+            if brand_id:
+                cur.execute(
+                    "SELECT * FROM imports WHERE brand_id=%s ORDER BY imported_at DESC",
+                    (brand_id,),
+                )
+            else:
+                cur.execute("SELECT * FROM imports ORDER BY imported_at DESC")
+            return cur.fetchall()
 
 
 def insert_rows(import_id: int, brand_id: int, rows: list[dict]):
+    if not rows:
+        return
     with get_conn() as conn:
-        conn.executemany(
-            """INSERT INTO performance_rows
-               (import_id, brand_id, date, platform, level, campaign, ad_set, ad,
-                keyword, spend, impressions, clicks, conversions, conversion_value,
-                reach, currency, result_type)
-               VALUES (:import_id, :brand_id, :date, :platform, :level, :campaign,
-                       :ad_set, :ad, :keyword, :spend, :impressions, :clicks,
-                       :conversions, :conversion_value, :reach, :currency, :result_type)""",
-            [{**r, "import_id": import_id, "brand_id": brand_id, "reach": r.get("reach")} for r in rows],
-        )
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(
+                cur,
+                """INSERT INTO performance_rows
+                   (import_id, brand_id, date, platform, level, campaign, ad_set, ad,
+                    keyword, spend, impressions, clicks, conversions, conversion_value,
+                    reach, currency, result_type)
+                   VALUES (%(import_id)s, %(brand_id)s, %(date)s, %(platform)s, %(level)s, %(campaign)s,
+                           %(ad_set)s, %(ad)s, %(keyword)s, %(spend)s, %(impressions)s, %(clicks)s,
+                           %(conversions)s, %(conversion_value)s, %(reach)s, %(currency)s, %(result_type)s)""",
+                [{**r, "import_id": import_id, "brand_id": brand_id, "reach": r.get("reach")} for r in rows],
+            )
 
 
 def rows_for_brand(brand_id: int, start: str | None = None, end: str | None = None):
-    q = "SELECT * FROM performance_rows WHERE brand_id=?"
+    q = "SELECT * FROM performance_rows WHERE brand_id=%s"
     params: list = [brand_id]
     if start:
-        q += " AND date >= ?"
+        q += " AND date >= %s"
         params.append(start)
     if end:
-        q += " AND date <= ?"
+        q += " AND date <= %s"
         params.append(end)
     with get_conn() as conn:
-        return conn.execute(q, params).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(q, params)
+            return cur.fetchall()
 
 
 # ------------------------------------------------------------------ tests --
@@ -275,61 +302,70 @@ def create_test(**kwargs) -> int:
     fields = ["brand_id", "name", "hypothesis", "variant_a_label", "variant_a_campaigns",
               "variant_b_label", "variant_b_campaigns", "started_at", "ended_at", "status"]
     cols = [f for f in fields if f in kwargs]
-    placeholders = ",".join(["?"] * len(cols))
+    placeholders = ",".join(["%s"] * len(cols))
     with get_conn() as conn:
-        cur = conn.execute(
-            f"INSERT INTO tests ({','.join(cols)}) VALUES ({placeholders})",
-            [kwargs[c] for c in cols],
-        )
-        return cur.lastrowid
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO tests ({','.join(cols)}) VALUES ({placeholders}) RETURNING id",
+                [kwargs[c] for c in cols],
+            )
+            return cur.fetchone()["id"]
 
 
-def list_tests(brand_id: int) -> list[sqlite3.Row]:
+def list_tests(brand_id: int) -> list[dict]:
     with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM tests WHERE brand_id=? ORDER BY started_at DESC", (brand_id,)
-        ).fetchall()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tests WHERE brand_id=%s ORDER BY started_at DESC", (brand_id,))
+            return cur.fetchall()
 
 
 # ----------------------------------------------------------------- orders --
 
 def insert_orders(import_id: int, brand_id: int, rows: list[dict]):
+    if not rows:
+        return
     with get_conn() as conn:
-        conn.executemany(
-            """INSERT INTO orders (import_id, brand_id, order_date, order_id, amount, raw_campaign, source)
-               VALUES (:import_id, :brand_id, :order_date, :order_id, :amount, :campaign, :source)""",
-            [{**r, "import_id": import_id, "brand_id": brand_id} for r in rows],
-        )
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(
+                cur,
+                """INSERT INTO orders (import_id, brand_id, order_date, order_id, amount, raw_campaign, source)
+                   VALUES (%(import_id)s, %(brand_id)s, %(order_date)s, %(order_id)s, %(amount)s, %(campaign)s, %(source)s)""",
+                [{**r, "import_id": import_id, "brand_id": brand_id} for r in rows],
+            )
 
 
-def orders_for_brand(brand_id: int, start: str | None = None, end: str | None = None) -> list[sqlite3.Row]:
-    q = "SELECT * FROM orders WHERE brand_id=?"
+def orders_for_brand(brand_id: int, start: str | None = None, end: str | None = None) -> list[dict]:
+    q = "SELECT * FROM orders WHERE brand_id=%s"
     params: list = [brand_id]
     if start:
-        q += " AND order_date >= ?"
+        q += " AND order_date >= %s"
         params.append(start)
     if end:
-        q += " AND order_date <= ?"
+        q += " AND order_date <= %s"
         params.append(end)
     with get_conn() as conn:
-        return conn.execute(q, params).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(q, params)
+            return cur.fetchall()
 
 
 def unmatched_raw_campaigns(brand_id: int) -> list[str]:
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT raw_campaign FROM orders WHERE brand_id=? AND matched_campaign IS NULL AND raw_campaign IS NOT NULL",
-            (brand_id,),
-        ).fetchall()
-        return [r["raw_campaign"] for r in rows]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT raw_campaign FROM orders WHERE brand_id=%s AND matched_campaign IS NULL AND raw_campaign IS NOT NULL",
+                (brand_id,),
+            )
+            return [r["raw_campaign"] for r in cur.fetchall()]
 
 
 def set_campaign_matches(brand_id: int, matches: dict[str, str | None]):
     """matches: {raw_campaign: matched_campaign_or_None}. None (or 'ignore')
     is stored as the literal string so it isn't re-suggested every time."""
     with get_conn() as conn:
-        for raw, matched in matches.items():
-            conn.execute(
-                "UPDATE orders SET matched_campaign=? WHERE brand_id=? AND raw_campaign=?",
-                (matched or "ignore", brand_id, raw),
-            )
+        with conn.cursor() as cur:
+            for raw, matched in matches.items():
+                cur.execute(
+                    "UPDATE orders SET matched_campaign=%s WHERE brand_id=%s AND raw_campaign=%s",
+                    (matched or "ignore", brand_id, raw),
+                )

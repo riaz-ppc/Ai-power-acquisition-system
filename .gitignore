@@ -8,3 +8,5 @@ sync/google_ads/google-ads.yaml
 sync/google_ads/client_secret*.json
 sync/google_ads/token.json
 sync/meta/meta-config.yaml
+.env
+.env.*

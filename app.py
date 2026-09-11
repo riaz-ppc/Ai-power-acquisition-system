@@ -642,7 +642,7 @@ with tab_export:
         st.write("**Targets & unit-economics assumptions**")
         col1, col2 = st.columns(2)
         with col1:
-            margin_pct = st.number_input("Contribution margin (%)", 0.0, 100.0, (brand["margin_pct"] or 0) * 100) / 100
+            margin_pct = st.number_input("Contribution margin (%)", 0.0, 100.0, (brand["margin_pct"] or 0.0) * 100) / 100
             aov = st.number_input("Avg. order value", 0.0, value=brand["aov"] or 0.0)
             ltv = st.number_input("Customer/student LTV", 0.0, value=brand["ltv"] or 0.0)
         with col2:
