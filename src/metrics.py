@@ -228,37 +228,27 @@ def forecast_trend(daily: pd.DataFrame, metric: str, lookback_days: int = 14,
     }
 
 
-def campaign_marginal_efficiency(df: pd.DataFrame, campaign: str, business_model: str,
-                                  lookback_days: int = 60) -> dict | None:
+def _fit_marginal_efficiency(daily: pd.DataFrame, business_model: str) -> dict | None:
     """
-    A campaign's average CPA/ROAS so far can look fine while the campaign
-    is already past the point of diminishing returns — or look mediocre
-    while still on the way up. This fits a simple power-law response
+    Shared curve-fit core for campaign_marginal_efficiency() and
+    platform_marginal_efficiency() — fits a simple power-law response
     curve (value ~ a * spend^b — the standard simplified shape for a
-    diminishing-returns media response, not a novel model) to the
-    campaign's own daily spend/value history, and reads the marginal
-    cost/value of the NEXT dollar off the fitted elasticity `b`:
-    b < 1 means diminishing returns (the margin is worse than the
-    average so far); b > 1 means still scaling well (the margin is
-    better than average).
+    diminishing-returns media response, not a novel model) to a daily
+    spend/value series, and reads the marginal cost/value of the NEXT
+    dollar off the fitted elasticity `b`: b < 1 means diminishing
+    returns (the margin is worse than the average so far); b > 1 means
+    still scaling well (the margin is better than average).
 
     Deliberately returns None — rather than a number the data can't
-    support — when: there's under 8 days of real spend+value in the
-    lookback window; day-to-day spend barely varies (coefficient of
-    variation < 0.15, i.e. nothing to fit a slope against); the fitted
-    line explains under 30% of the variance (r_squared < 0.3); or, for
-    a CPA campaign, the fitted elasticity is at or below zero (spend
-    increases aren't tracking with conversions at all — inverting that
-    into a "marginal CPA" would be nonsense, though a flat/negative
-    elasticity is itself worth knowing and shows up via r_squared/None).
+    support — when: there's under 8 days of real spend+value; day-to-
+    day spend barely varies (coefficient of variation < 0.15, i.e.
+    nothing to fit a slope against); the fitted line explains under 30%
+    of the variance (r_squared < 0.3); or, for a CPA series, the fitted
+    elasticity is at or below zero (spend increases aren't tracking
+    with conversions at all — inverting that into a "marginal CPA"
+    would be nonsense, though a flat/negative elasticity is itself
+    worth knowing and shows up via r_squared/None).
     """
-    if df.empty:
-        return None
-    value_col = "conversion_value" if business_model == "transactional" else "conversions"
-    end = df["date"].max()
-    start = end - pd.Timedelta(days=lookback_days)
-    camp_df = df[(df["campaign"] == campaign) & (df["date"] >= start) & (df["date"] <= end)]
-    daily = camp_df.groupby("date", dropna=False).agg(spend=("spend", "sum"), value=(value_col, "sum")).reset_index()
     daily = daily[(daily["spend"] > 0) & (daily["value"] > 0)]
     if len(daily) < 8:
         return None
@@ -297,39 +287,68 @@ def campaign_marginal_efficiency(df: pd.DataFrame, campaign: str, business_model
     }
 
 
-def budget_reallocation_view(df: pd.DataFrame, camp_agg: pd.DataFrame, brand,
-                              min_spend_share: float = 0.05, lookback_days: int = 60) -> list[dict]:
-    """
-    Ranks this period's campaigns (excluding trivial ones under
-    `min_spend_share` of total spend, to keep noise out) by the best
-    available read on where the NEXT dollar is efficient: a marginal
-    estimate from campaign_marginal_efficiency() when the campaign's own
-    history supports one, falling back to plain average CPA/ROAS —
-    clearly labeled as such — when it doesn't. This is the basis for a
-    reallocation suggestion, not a guaranteed-optimal budget split: it
-    says which campaigns are worth a real look, not exactly how many
-    pounds/taka to move.
-    """
-    if camp_agg.empty:
+def campaign_marginal_efficiency(df: pd.DataFrame, campaign: str, business_model: str,
+                                  lookback_days: int = 60) -> dict | None:
+    """Is the next dollar spent on THIS campaign still efficient? See
+    _fit_marginal_efficiency() for the method and why it returns None
+    rather than a number the data can't support."""
+    if df.empty:
+        return None
+    value_col = "conversion_value" if business_model == "transactional" else "conversions"
+    end = df["date"].max()
+    start = end - pd.Timedelta(days=lookback_days)
+    camp_df = df[(df["campaign"] == campaign) & (df["date"] >= start) & (df["date"] <= end)]
+    daily = camp_df.groupby("date", dropna=False).agg(spend=("spend", "sum"), value=(value_col, "sum")).reset_index()
+    return _fit_marginal_efficiency(daily, business_model)
+
+
+def platform_marginal_efficiency(df: pd.DataFrame, platform: str, business_model: str,
+                                  lookback_days: int = 60) -> dict | None:
+    """Same question one level up: is the next dollar better spent on
+    THIS platform (combining all its campaigns) than elsewhere — "Meta
+    vs. Google/Microsoft," not "which campaign within one platform."
+    Same method and same None-rather-than-guess guards as
+    campaign_marginal_efficiency() — see _fit_marginal_efficiency()."""
+    if df.empty:
+        return None
+    value_col = "conversion_value" if business_model == "transactional" else "conversions"
+    end = df["date"].max()
+    start = end - pd.Timedelta(days=lookback_days)
+    plat_df = df[(df["platform"] == platform) & (df["date"] >= start) & (df["date"] <= end)]
+    daily = plat_df.groupby("date", dropna=False).agg(spend=("spend", "sum"), value=(value_col, "sum")).reset_index()
+    return _fit_marginal_efficiency(daily, business_model)
+
+
+def _rank_by_marginal_efficiency(entity_agg: pd.DataFrame, entity_col: str, marginal_fn, brand,
+                                  min_spend_share: float) -> list[dict]:
+    """Shared ranking core for budget_reallocation_view() (entity =
+    campaign) and cross_platform_reallocation_view() (entity =
+    platform): ranks entities with a real spend share by the best
+    available read on where the NEXT dollar is efficient — a marginal
+    estimate where the entity's own history supports one, falling back
+    to plain average CPA/ROAS, clearly labeled as such, where it
+    doesn't. Basis for a reallocation suggestion, not a guaranteed-
+    optimal split: says what's worth a look, not exactly how much to move."""
+    if entity_agg.empty:
         return []
-    total_spend = camp_agg["spend"].sum()
+    total_spend = entity_agg["spend"].sum()
     if not total_spend:
         return []
     is_transactional = brand["business_model"] == "transactional"
     target = brand.get("target_roas") if is_transactional else brand.get("target_cpa")
 
     rows = []
-    for _, r in camp_agg.iterrows():
+    for _, r in entity_agg.iterrows():
         if r["spend"] < total_spend * min_spend_share:
             continue
-        marginal = campaign_marginal_efficiency(df, r["campaign"], brand["business_model"], lookback_days)
+        marginal = marginal_fn(r[entity_col])
         avg_metric = r.get("roas") if is_transactional else r.get("cpa")
         ranking_metric = marginal["marginal_metric"] if marginal else avg_metric
         efficient_at_target = None
         if target and ranking_metric is not None:
             efficient_at_target = (ranking_metric >= target) if is_transactional else (ranking_metric <= target)
         rows.append({
-            "campaign": r["campaign"], "spend": float(r["spend"]),
+            entity_col: r[entity_col], "spend": float(r["spend"]),
             "avg_metric": float(avg_metric) if avg_metric is not None else None,
             "marginal_metric": marginal["marginal_metric"] if marginal else None,
             "elasticity": marginal["elasticity"] if marginal else None,
@@ -346,6 +365,38 @@ def budget_reallocation_view(df: pd.DataFrame, camp_agg: pd.DataFrame, brand,
 
     rows.sort(key=_sort_key)
     return rows
+
+
+def budget_reallocation_view(df: pd.DataFrame, camp_agg: pd.DataFrame, brand,
+                              min_spend_share: float = 0.05, lookback_days: int = 60) -> list[dict]:
+    """Ranks this period's campaigns by where the next dollar is
+    efficient — see _rank_by_marginal_efficiency()."""
+    return _rank_by_marginal_efficiency(
+        camp_agg, "campaign",
+        lambda campaign: campaign_marginal_efficiency(df, campaign, brand["business_model"], lookback_days),
+        brand, min_spend_share,
+    )
+
+
+def cross_platform_reallocation_view(df: pd.DataFrame, brand, min_spend_share: float = 0.05,
+                                      lookback_days: int = 60) -> list[dict]:
+    """
+    Same ranking as budget_reallocation_view(), one level up: which
+    PLATFORM — not which campaign within one — is the more efficient
+    place for the next dollar right now. Only meaningful once a brand
+    actually spends on more than one platform in this data; returns []
+    otherwise rather than "ranking" a single platform against itself.
+    """
+    if df.empty:
+        return []
+    plat_agg = aggregate(df, by=["platform"])
+    if len(plat_agg) < 2:
+        return []
+    return _rank_by_marginal_efficiency(
+        plat_agg, "platform",
+        lambda platform: platform_marginal_efficiency(df, platform, brand["business_model"], lookback_days),
+        brand, min_spend_share,
+    )
 
 
 def campaign_totals(df: pd.DataFrame, campaign: str, start, end) -> dict:

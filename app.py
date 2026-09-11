@@ -799,6 +799,46 @@ with tab_insights:
                     st.success(f"No large efficiency gap between campaigns this period (best vs. worst "
                                f"differ by {gap_pct:.0f}%) — nothing worth disrupting budgets over yet.")
 
+        cross_platform = metrics.cross_platform_reallocation_view(df, brand)
+        if cross_platform:
+            st.markdown("---")
+            st.markdown("#### Cross-platform reallocation")
+            st.caption("Same idea, one level up: not which campaign within a platform, but which "
+                       "PLATFORM — Meta vs. Google/Microsoft — is the more efficient place for the "
+                       "next pound/taka right now. Only shown once this brand actually spends on more "
+                       "than one platform.")
+            fmt_cp = (lambda v: money(v, brand["currency"])) if realloc_metric == "cpa" else ratio
+            cp_table = pd.DataFrame([{
+                "Platform": r["platform"],
+                "Spend": money(r["spend"], brand["currency"]),
+                f"Avg {realloc_metric.upper()}": fmt_cp(r["avg_metric"]) if r["avg_metric"] is not None else "—",
+                f"Marginal {realloc_metric.upper()}": fmt_cp(r["marginal_metric"]) if r["marginal_metric"] is not None else "—",
+                "Basis": "marginal (curve fit)" if r["marginal_metric"] is not None else "average only",
+                "Fit R²": r["r_squared"] if r["r_squared"] is not None else "—",
+            } for r in cross_platform])
+            st.dataframe(cp_table, hide_index=True, use_container_width=True)
+
+            cp_best, cp_worst = cross_platform[0], cross_platform[-1]
+            if (cp_best["ranking_metric"] is not None and cp_worst["ranking_metric"] is not None
+                    and cp_best["platform"] != cp_worst["platform"]):
+                cp_gap_pct = abs(cp_worst["ranking_metric"] - cp_best["ranking_metric"]) / abs(cp_best["ranking_metric"]) * 100 \
+                    if cp_best["ranking_metric"] else 0
+                if cp_gap_pct >= 25:
+                    cp_test_amount = cp_worst["spend"] * 0.15
+                    st.warning(
+                        f"**{cp_best['platform']}** looks like the more efficient platform for the next "
+                        f"pound/taka right now ({cp_best['basis']}: {fmt_cp(cp_best['ranking_metric'])}) vs. "
+                        f"**{cp_worst['platform']}** ({cp_worst['basis']}: {fmt_cp(cp_worst['ranking_metric'])}) — "
+                        f"a {cp_gap_pct:.0f}% gap. Worth testing a shift of roughly "
+                        f"{money(cp_test_amount, brand['currency'])} (~15% of {cp_worst['platform']}'s spend "
+                        f"this period) toward {cp_best['platform']} and watching what happens — a suggested "
+                        f"test size across platforms, not a guaranteed-optimal split."
+                    )
+                else:
+                    st.success(f"No large efficiency gap between platforms this period (best vs. worst "
+                               f"differ by {cp_gap_pct:.0f}%) — nothing worth shifting budget across "
+                               f"platforms for yet.")
+
         kw_scoped = df[(df["date"] >= pd.Timestamp(cur_start)) & (df["date"] <= pd.Timestamp(cur_end))]
         if (kw_scoped["platform"].isin(["google", "microsoft"]) & kw_scoped["keyword"].notna()).any():
             st.markdown("---")
