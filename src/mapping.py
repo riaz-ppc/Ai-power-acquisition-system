@@ -39,8 +39,11 @@ REQUIRED_FOR_IMPORT = ["date", "campaign", "spend"]
 
 
 def _norm(h: str) -> str:
-    """Lowercase, trim, collapse whitespace — for matching, never for display."""
-    return re.sub(r"\s+", " ", str(h).strip().lower())
+    """Lowercase, trim, collapse whitespace — for matching, never for display.
+    Underscores collapse to spaces too: a raw header can legitimately be
+    spelled "actual_revenue" or "Actual Revenue" for the same thing, and
+    both should match the one synonym key below."""
+    return re.sub(r"[\s_]+", " ", str(h).strip().lower())
 
 
 @dataclass
@@ -131,6 +134,7 @@ META = PlatformProfile(
         "website purchases": "conversions",
         "purchases conversion value": "conversion_value",
         "website purchases conversion value": "conversion_value",
+        "revenue": "conversion_value", "actual revenue": "conversion_value",
         "purchase roas (return on ad spend)": None,  # derived, recomputed downstream
         "currency": "currency",
     },
@@ -169,7 +173,7 @@ GOOGLE = PlatformProfile(
         "conversions": "conversions",
         "conv. value": "conversion_value",
         "all conv. value": "conversion_value",
-        "revenue": "conversion_value",
+        "revenue": "conversion_value", "actual revenue": "conversion_value",
         "conversion action": "result_type",
     },
     regex_map=[],
@@ -199,7 +203,7 @@ MICROSOFT = PlatformProfile(
         "impr.": "impressions",
         "clicks": "clicks",
         "conversions": "conversions",
-        "revenue": "conversion_value",
+        "revenue": "conversion_value", "actual revenue": "conversion_value",
     },
     regex_map=[],
     level_rules=[

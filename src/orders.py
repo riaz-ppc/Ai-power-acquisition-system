@@ -25,6 +25,7 @@ ORDER_HEADER_SYNONYMS = {
     "date": "order_date", "order date": "order_date", "created": "order_date",
     "order id": "order_id", "order #": "order_id", "id": "order_id",
     "amount": "amount", "total": "amount", "order total": "amount",
+    "revenue": "amount", "actual revenue": "amount", "actual value": "amount",
     "campaign name": "campaign", "campaign": "campaign",
     "source": "source", "channel": "source", "platform": "source",
 }
@@ -39,7 +40,10 @@ _AMOUNT_RE = re.compile(r"[^0-9.\-]")
 
 
 def _norm(h: str) -> str:
-    return re.sub(r"\s+", " ", str(h).strip().lower())
+    # Underscores collapse to spaces too, not just whitespace — a raw
+    # header can legitimately be spelled "actual_revenue" or "Actual
+    # Revenue" for the same thing, and both should match one synonym key.
+    return re.sub(r"[\s_]+", " ", str(h).strip().lower())
 
 
 def looks_like_order_sheet(headers: list[str]) -> bool:
