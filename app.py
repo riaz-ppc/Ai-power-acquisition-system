@@ -1085,6 +1085,34 @@ with tab_recon:
                            "whether the platform tracks conversion value at all. platform_roas: what the "
                            "platform's own claimed conversion value would imply, for comparison.")
 
+                st.markdown("---")
+                st.caption("The button below merges conversion_value = actual_revenue directly into this "
+                           "brand's stored performance data for matched campaigns in this date range — but "
+                           "ONLY where the platform's own conversion_value is currently 0/blank, so a "
+                           "platform that genuinely tracks revenue (real pixel-based ROAS) is never silently "
+                           "overwritten by potentially-incomplete order data. Once applied, ROAS-based "
+                           "insights, root-cause decomposition, and budget reallocation elsewhere in this app "
+                           "see your real revenue instead of a platform-reported zero. Re-importing the "
+                           "platform file later resets conversion_value back to whatever the platform reports.")
+                campaign_to_platform = {c: p for p, cs in campaigns_by_platform.items() for c in cs}
+                if st.button("Merge conversion_value = actual_revenue"):
+                    total_updated = 0
+                    skipped = []
+                    for campaign in recon["campaign"]:
+                        platform = campaign_to_platform.get(campaign)
+                        if not platform:
+                            skipped.append(campaign)
+                            continue
+                        camp_orders = odf[odf["matched_campaign"] == campaign]
+                        amount_by_date = camp_orders.groupby("order_date")["amount"].sum().to_dict()
+                        total_updated += db.apply_actual_revenue(brand_id, platform, campaign, amount_by_date)
+                    msg = (f"Updated {total_updated} row(s) — conversion_value now reflects real order "
+                           f"revenue wherever the platform reported none.")
+                    if skipped:
+                        msg += f" Skipped (couldn't tell which platform): {', '.join(skipped)}."
+                    st.success(msg)
+                    st.rerun()
+
 # ------------------------------------------------------------- settings ---
 
 with tab_export:

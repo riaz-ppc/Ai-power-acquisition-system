@@ -269,6 +269,41 @@ def rename_campaign(brand_id: int, platform: str, old_name: str, new_name: str) 
             return cur.rowcount
 
 
+def apply_actual_revenue(brand_id: int, platform: str, campaign: str,
+                          amount_by_date: dict[str, float]) -> int:
+    """
+    Overwrites performance_rows.conversion_value for one campaign, on
+    exactly the dates given, with real order revenue — for when the
+    platform never tracked a conversion value at all (routine for
+    lead-gen accounts) and the viewer has real revenue from a matched
+    order import instead. Only ever called after the viewer has reviewed
+    the reconciliation table and explicitly confirmed — this replaces
+    the platform's own number, so it's a deliberate action, not a
+    background sync.
+
+    Scoped narrowly on purpose: only rows already at campaign level
+    (ad_set/ad/keyword-level rows for the same campaign+date are left
+    alone — there's no honest way to know how to split one day's real
+    revenue across multiple ad sets/ads/keywords from order data alone),
+    and only where the existing conversion_value is 0 or NULL — a
+    platform that DID report a real conversion value (proper pixel
+    tracking) never gets silently overwritten by potentially-incomplete
+    order data. Returns rows affected.
+    """
+    updated = 0
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for order_date, amount in amount_by_date.items():
+                cur.execute(
+                    "UPDATE performance_rows SET conversion_value=%s "
+                    "WHERE brand_id=%s AND platform=%s AND campaign=%s AND date=%s "
+                    "AND level='campaign' AND (conversion_value IS NULL OR conversion_value=0)",
+                    (amount, brand_id, platform, campaign, order_date),
+                )
+                updated += cur.rowcount
+    return updated
+
+
 def list_imports(brand_id: int | None = None) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
