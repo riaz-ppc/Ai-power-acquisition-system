@@ -314,18 +314,15 @@ with tab_import:
                 date_start_for_import = str(period_start) if period_start else result.date_start
                 date_end_for_import = str(period_end) if period_end else result.date_end
 
+                overlaps = []
                 if not confirm_disabled:
                     overlaps = db.find_overlapping_import(
                         brand_id, result.platform_id, date_start_for_import, date_end_for_import
                     )
-                    if overlaps:
-                        st.warning(
-                            f"This date range overlaps {len(overlaps)} existing import(s) for "
-                            f"{result.platform_label} already on file. Importing again will add "
-                            f"duplicate rows unless you delete the old import first (Settings tab)."
-                        )
 
-                if st.button(f"Confirm import — {sub_name}", key=f"import_{key}", disabled=confirm_disabled):
+                def _do_import(replace: bool):
+                    if replace:
+                        db.delete_rows_in_range(brand_id, result.platform_id, date_start_for_import, date_end_for_import)
                     import_id = db.create_import(
                         brand_id=brand_id, platform=result.platform_id, level=result.level,
                         filename=sub_name, date_start=date_start_for_import, date_end=date_end_for_import,
@@ -334,8 +331,28 @@ with tab_import:
                         notes="; ".join(result.warnings),
                     )
                     db.insert_rows(import_id, brand_id, rows_to_import)
-                    st.success(f"Imported {len(rows_to_import)} rows.")
+                    st.success(f"Imported {len(rows_to_import)} rows"
+                               + (" (old rows in this date range were replaced)." if replace else "."))
                     st.rerun()
+
+                if overlaps:
+                    st.warning(
+                        f"This date range overlaps {len(overlaps)} existing import(s) for "
+                        f"{result.platform_label} already on file — same platform, same dates. "
+                        f"Choose how to handle it:"
+                    )
+                    oc1, oc2 = st.columns(2)
+                    with oc1:
+                        if st.button(f"Replace overlapping data & import", key=f"replace_{key}",
+                                     disabled=confirm_disabled, type="primary"):
+                            _do_import(replace=True)
+                    with oc2:
+                        if st.button(f"Add anyway (creates duplicates)", key=f"dupe_{key}",
+                                     disabled=confirm_disabled):
+                            _do_import(replace=False)
+                else:
+                    if st.button(f"Confirm import — {sub_name}", key=f"import_{key}", disabled=confirm_disabled):
+                        _do_import(replace=False)
 
     st.markdown("---")
     st.caption("**Not built yet:** automatic API sync (Meta/Google/Microsoft Marketing APIs) — "
