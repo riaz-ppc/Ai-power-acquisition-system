@@ -1429,11 +1429,17 @@ with tab_export:
             r_camp_agg = metrics.aggregate(r_scoped, by=["campaign"])
             r_daily = metrics.aggregate(r_scoped, by=["date"])
             r_insights = metrics.generate_insights(r_camp_agg, brand) if include_insights_flag else []
+            # Forecast needs real lookback history, not just the report's own window (which could be
+            # a single week) — fit against everything up to the report's end date, same as Insights tab.
+            r_forecast_daily = metrics.aggregate(rdf[rdf["date"] <= pd.Timestamp(r_end)], by=["date"])
+            r_forecast = metrics.forecast_trend(
+                r_forecast_daily, "roas" if brand["business_model"] == "transactional" else "cpa"
+            )
 
             if st.button("Generate PDF report"):
                 pdf_bytes = report.build_pdf_report(
                     brand, str(r_start), str(r_end), r_camp_agg, r_econ, r_daily,
-                    r_insights, include_insights=include_insights_flag,
+                    r_insights, include_insights=include_insights_flag, forecast=r_forecast,
                 )
                 st.download_button(
                     "Download PDF", pdf_bytes,

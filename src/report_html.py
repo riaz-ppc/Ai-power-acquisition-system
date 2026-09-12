@@ -104,7 +104,7 @@ def _line_chart_svg(daily: pd.DataFrame, col: str, label: str, color: str) -> st
 
 def build_report_html(brand: dict, date_start: str, date_end: str,
                        camp_agg: pd.DataFrame, econ: dict, daily: pd.DataFrame,
-                       insights: list) -> str:
+                       insights: list, forecast: dict | None = None) -> str:
     ccy = brand["currency"]
     is_transactional = brand["business_model"] == "transactional"
     metric_col = "roas" if is_transactional else "cpa"
@@ -139,16 +139,40 @@ def build_report_html(brand: dict, date_start: str, date_end: str,
     insights_html = ""
     if insights:
         for ins in insights:
+            action_html = (f'<p><strong>&rarr; Suggested action:</strong> {_esc(ins.suggested_action)}</p>'
+                            if ins.suggested_action else "")
             insights_html += (
                 f'<div class="insight insight-{ins.severity}">'
                 f'<div class="insight-head"><span class="pill pill-{ins.severity}">{SEVERITY_LABEL.get(ins.severity, ins.severity)}</span>'
                 f'<strong>{_esc(ins.title)}</strong></div>'
                 f'<p>{_esc(ins.detail)}</p>'
+                f'{action_html}'
                 f'<div class="insight-meta">metric: {_esc(ins.metric)} · threshold: {_esc(ins.threshold)} · formula: {_esc(ins.formula)}</div>'
                 f'</div>'
             )
     else:
         insights_html = '<p class="muted">No threshold breaches this period.</p>'
+
+    forecast_html = ""
+    if forecast is not None:
+        fmt_forecast = (lambda v: _money(v, ccy)) if metric_col == "cpa" else (lambda v: f"{v:.2f}x")
+        fit_note = "a fairly consistent trend" if forecast["r_squared"] >= 0.5 else "noisy — treat loosely"
+        forecast_html = (
+            f'<p>Projecting the last {forecast["lookback_points"]} days\' momentum forward '
+            f'(straight-line, not seasonality-aware): {_esc(metric_label)} is projected at '
+            f'{fmt_forecast(forecast["projected_value_end"])} in 7 days '
+            f'({forecast["pct_change_projected"]:+.1f}% vs. today), fit R²={forecast["r_squared"]} ({fit_note}).</p>'
+        )
+        target_val = brand.get("target_cpa") if metric_col == "cpa" else brand.get("target_roas")
+        if target_val:
+            breaches = (forecast["projected_value_end"] > target_val) if metric_col == "cpa" \
+                else (forecast["projected_value_end"] < target_val)
+            if breaches:
+                forecast_html += (
+                    f'<p><span class="pill pill-critical">Critical</span> At this trend, projected '
+                    f'{_esc(metric_label)} in 7 days would be past the {fmt_forecast(target_val)} target — '
+                    f'worth acting before it gets there, not after.</p>'
+                )
 
     spend_chart = _line_chart_svg(daily, "spend", f"Spend ({ccy})", "#2a78d6")
     metric_chart = _line_chart_svg(daily, metric_col, metric_label, "#d95926")
@@ -234,6 +258,7 @@ th{{font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:upperca
     <table><thead><tr><th>Campaign</th><th class="num">Spend</th><th class="num">Conversions</th><th class="num">{_esc(metric_label)}</th></tr></thead>
     <tbody>{rows_html}</tbody></table>
   </div>
+  {f'<div class="card"><h2>Trend forecast</h2>{forecast_html}</div>' if forecast_html else ''}
   <div class="card">
     <h2>Growth insights</h2>
     {insights_html}

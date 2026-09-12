@@ -63,7 +63,8 @@ def _chart_image(daily: pd.DataFrame, metric_col: str, metric_label: str, curren
 
 def build_pdf_report(brand: dict, date_start: str, date_end: str,
                       camp_agg: pd.DataFrame, econ: dict, daily: pd.DataFrame,
-                      insights: list, include_insights: bool = True) -> bytes:
+                      insights: list, include_insights: bool = True,
+                      forecast: dict | None = None) -> bytes:
     ccy = brand["currency"]
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("TitleX", parent=styles["Title"], textColor=NAVY, fontSize=20)
@@ -145,6 +146,32 @@ def build_pdf_report(brand: dict, date_start: str, date_end: str,
     ]))
     story.append(camp_table)
 
+    # ---- trend forecast ----
+    if forecast is not None:
+        story.append(Paragraph("Trend forecast", h2_style))
+        forecast_metric = "roas" if brand["business_model"] == "transactional" else "cpa"
+        fmt_forecast = (lambda v: _money(v, ccy)) if forecast_metric == "cpa" else (lambda v: f"{v:.2f}x")
+        story.append(Paragraph(
+            f"Projecting the last {forecast['lookback_points']} days' momentum forward "
+            f"(straight-line, not seasonality-aware): {forecast_metric.upper()} is projected at "
+            f"{fmt_forecast(forecast['projected_value_end'])} in 7 days "
+            f"({forecast['pct_change_projected']:+.1f}% vs. today), fit "
+            f"R²={forecast['r_squared']} ({'a fairly consistent trend' if forecast['r_squared'] >= 0.5 else 'noisy — treat loosely'}).",
+            body_style,
+        ))
+        target_val = brand.get("target_cpa") if forecast_metric == "cpa" else brand.get("target_roas")
+        if target_val:
+            breaches = (forecast["projected_value_end"] > target_val) if forecast_metric == "cpa" \
+                else (forecast["projected_value_end"] < target_val)
+            if breaches:
+                story.append(Paragraph(
+                    f'<font color="{SEVERITY_COLOR["critical"].hexval()}">●</font> At this trend, projected '
+                    f"{forecast_metric.upper()} in 7 days would be past the {fmt_forecast(target_val)} target — "
+                    f"worth acting before it gets there, not after.",
+                    body_style,
+                ))
+        story.append(Spacer(1, 8))
+
     # ---- insights ----
     if include_insights and insights:
         story.append(Paragraph("Growth insights", h2_style))
@@ -154,6 +181,8 @@ def build_pdf_report(brand: dict, date_start: str, date_end: str,
                 f'<font color="{badge_color.hexval()}">●</font> <b>{ins.title}</b>', body_style,
             ))
             story.append(Paragraph(ins.detail, body_style))
+            if ins.suggested_action:
+                story.append(Paragraph(f"<b>→ Suggested action:</b> {ins.suggested_action}", body_style))
             story.append(Paragraph(
                 f"metric: {ins.metric} · threshold: {ins.threshold} · formula: {ins.formula}", caption_style,
             ))
