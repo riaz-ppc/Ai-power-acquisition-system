@@ -765,10 +765,15 @@ with tab_insights:
     else:
         df = metrics.rows_to_df(all_rows)
         max_d = df["date"].max().date()
-        window = st.selectbox("Compare current period vs. baseline", ["Last 7 vs prior 7", "Last 30 vs prior 30"], index=1)
+        window = st.selectbox("Compare current period vs. baseline",
+                               ["Last 7 vs prior 7", "Last 30 vs prior 30", "Last 30 vs same 30 days last year"],
+                               index=1)
         n = 7 if "7" in window else 30
         cur_start, cur_end = max_d - timedelta(days=n - 1), max_d
-        base_start, base_end = cur_start - timedelta(days=n), cur_start - timedelta(days=1)
+        if "last year" in window:
+            base_start, base_end = cur_start - timedelta(days=365), cur_end - timedelta(days=365)
+        else:
+            base_start, base_end = cur_start - timedelta(days=n), cur_start - timedelta(days=1)
 
         compare = metrics.compare_periods(df, cur_start, cur_end, base_start, base_end)
         camp_scoped = df[(df["date"] >= pd.Timestamp(cur_start)) & (df["date"] <= pd.Timestamp(cur_end))]
