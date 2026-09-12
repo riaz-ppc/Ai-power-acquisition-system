@@ -365,6 +365,20 @@ if os.environ.get("APP_PASSWORD") and st.sidebar.button("Log out"):
 brands = db.list_brands()
 brand_names = {b["name"]: b["id"] for b in brands}
 
+with st.sidebar.expander("❓ How this app works", expanded=(len(brands) == 0)):
+    st.markdown(
+        "**1. Create a brand** below — one per business/account you advertise for.\n\n"
+        "**2. Import** — drop the CSV/Excel export from Meta, Google, or Microsoft Ads for that brand. "
+        "The platform, report level, and columns are all detected automatically.\n\n"
+        "**3. Check Digest first** — one ranked list of the most important thing(s) to act on this week, "
+        "pulled from everything below it. If you manage more than one brand, turn on **Portfolio view** "
+        "just below to see every brand's top issue at once, without switching brands one at a time.\n\n"
+        "**4. Dig deeper as needed** — Dashboard for the numbers, Insights for why something moved and "
+        "what's worth scaling or cutting, Reconciliation to check real revenue against what the platform "
+        "reports, A/B Tests to confirm a change actually worked, Settings to adjust targets or export data.\n\n"
+        "Switch which brand you're looking at with the **Brand** dropdown below at any time."
+    )
+
 with st.sidebar.expander("+ New brand", expanded=(len(brands) == 0)):
     with st.form("new_brand"):
         name = st.text_input("Brand name")
