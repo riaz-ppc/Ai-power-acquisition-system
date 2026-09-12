@@ -319,6 +319,30 @@ def platform_marginal_efficiency(df: pd.DataFrame, platform: str, business_model
     return _fit_marginal_efficiency(daily, business_model)
 
 
+def account_marginal_efficiency(df: pd.DataFrame, business_model: str,
+                                 lookback_days: int = 60) -> dict | None:
+    """
+    One level up again: is the next dollar spent ANYWHERE in this
+    account — every campaign, every platform, combined — still
+    efficient, or has total account spend already passed the point of
+    diminishing returns? This answers "should total budget grow" as a
+    distinct question from "which campaign/platform should get the next
+    dollar" (budget_reallocation_view / cross_platform_reallocation_
+    view) — an account can have plenty of room to reallocate between
+    lines while still being past the point where raising the OVERALL
+    budget makes sense, or vice versa. Same fitted power-law method and
+    same None-rather-than-guess guards — see _fit_marginal_efficiency().
+    """
+    if df.empty:
+        return None
+    value_col = "conversion_value" if business_model == "transactional" else "conversions"
+    end = df["date"].max()
+    start = end - pd.Timedelta(days=lookback_days)
+    scoped = df[(df["date"] >= start) & (df["date"] <= end)]
+    daily = scoped.groupby("date", dropna=False).agg(spend=("spend", "sum"), value=(value_col, "sum")).reset_index()
+    return _fit_marginal_efficiency(daily, business_model)
+
+
 def _rank_by_marginal_efficiency(entity_agg: pd.DataFrame, entity_col: str, marginal_fn, brand,
                                   min_spend_share: float) -> list[dict]:
     """Shared ranking core for budget_reallocation_view() (entity =

@@ -1014,6 +1014,40 @@ with tab_insights:
                                f"differ by {cp_gap_pct:.0f}%) — nothing worth shifting budget across "
                                f"platforms for yet.")
 
+        account_marginal = metrics.account_marginal_efficiency(df, brand["business_model"])
+        if account_marginal:
+            st.markdown("---")
+            st.markdown("#### Account-wide budget capacity")
+            st.caption("A different question from reallocation above: not which campaign or platform "
+                       "should get the next pound, but whether growing TOTAL account spend still makes "
+                       "sense at all — the same marginal-efficiency method, applied to the whole account "
+                       "combined.")
+            fmt_acct = (lambda v: money(v, brand["currency"])) if realloc_metric == "cpa" else ratio
+            ac1, ac2 = st.columns(2)
+            ac1.metric(f"Average {realloc_metric.upper()} (last {account_marginal['days_used']} days)",
+                       fmt_acct(account_marginal["avg_metric"]))
+            ac2.metric(f"Marginal {realloc_metric.upper()} (next pound/taka)",
+                       fmt_acct(account_marginal["marginal_metric"]))
+            fit_note = "still scaling well" if account_marginal["elasticity"] >= 1 else "diminishing returns"
+            st.caption(f"Elasticity: {account_marginal['elasticity']} ({fit_note}), "
+                       f"fit R²={account_marginal['r_squared']}.")
+
+            acct_target = brand["target_cpa"] if realloc_metric == "cpa" else brand["target_roas"]
+            if acct_target:
+                marginal_ok = (account_marginal["marginal_metric"] <= acct_target) if realloc_metric == "cpa" \
+                    else (account_marginal["marginal_metric"] >= acct_target)
+                if marginal_ok:
+                    st.success(f"There's still room to grow total budget — the next pound/taka account-wide "
+                               f"would land at roughly {fmt_acct(account_marginal['marginal_metric'])}, still "
+                               f"within your {fmt_acct(acct_target)} target.")
+                else:
+                    st.warning(f"Total account spend looks past the point of diminishing returns — the next "
+                               f"pound/taka account-wide would land at roughly "
+                               f"{fmt_acct(account_marginal['marginal_metric'])}, already past your "
+                               f"{fmt_acct(acct_target)} target. Growth from here is more likely to come from "
+                               f"reallocating toward the efficient campaigns/platforms already identified "
+                               f"above than from simply raising the total budget.")
+
         kw_scoped = df[(df["date"] >= pd.Timestamp(cur_start)) & (df["date"] <= pd.Timestamp(cur_end))]
         if (kw_scoped["platform"].isin(["google", "microsoft"]) & kw_scoped["keyword"].notna()).any():
             st.markdown("---")
