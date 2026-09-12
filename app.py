@@ -257,6 +257,106 @@ def _format_decomposition(decomp: dict, business_model: str, ccy: str) -> str:
     return text
 
 
+def compute_digest_items(df: pd.DataFrame, brand: dict, n: int = 7) -> list[dict]:
+    """Every item comes straight from an already-tested metrics.* function —
+    see the Digest tab and the portfolio view, both of which render this same
+    list. Returns items sorted by priority (0=critical/1=watch/2=opportunity)
+    then by dollar impact within a tier; [] means nothing worth flagging."""
+    max_d = df["date"].max().date()
+    cur_start, cur_end = max_d - timedelta(days=n - 1), max_d
+    base_start, base_end = cur_start - timedelta(days=n), cur_start - timedelta(days=1)
+
+    compare = metrics.compare_periods(df, cur_start, cur_end, base_start, base_end)
+    camp_scoped = df[(df["date"] >= pd.Timestamp(cur_start)) & (df["date"] <= pd.Timestamp(cur_end))]
+    camp_agg = metrics.aggregate(camp_scoped, by=["campaign"])
+    full_daily = metrics.aggregate(df, by=["date"])
+
+    items = []
+
+    for ins in metrics.generate_insights(camp_agg, brand, compare):
+        priority = {"critical": 0, "watch": 1, "scale": 2}.get(ins.severity, 1)
+        detail = ins.detail + (f" → {ins.suggested_action}" if ins.suggested_action else "")
+        items.append({"priority": priority, "impact": 0.0,
+                       "badge": {"critical": "🔴", "watch": "🟡", "scale": "🟢"}.get(ins.severity, ""),
+                       "title": ins.title, "detail": detail})
+
+    forecast_metric = "roas" if brand["business_model"] == "transactional" else "cpa"
+    forecast = metrics.forecast_trend(full_daily, forecast_metric)
+    if forecast:
+        target_val = brand["target_cpa"] if forecast_metric == "cpa" else brand["target_roas"]
+        if target_val:
+            fmt_val = (lambda v: money(v, brand["currency"])) if forecast_metric == "cpa" else ratio
+            breaches = (forecast["projected_value_end"] > target_val) if forecast_metric == "cpa" \
+                else (forecast["projected_value_end"] < target_val)
+            if breaches:
+                items.append({
+                    "priority": 0, "impact": 0.0, "badge": "🔴",
+                    "title": f"Blended {forecast_metric.upper()} trending toward a target breach",
+                    "detail": f"At this trend, projected {forecast_metric.upper()} in 7 days "
+                              f"({fmt_val(forecast['projected_value_end'])}) would be past your target "
+                              f"({fmt_val(target_val)}) — worth acting before it gets there.",
+                })
+
+    realloc = metrics.budget_reallocation_view(df, camp_agg, brand)
+    if realloc:
+        best, worst = realloc[0], realloc[-1]
+        if (best["ranking_metric"] is not None and worst["ranking_metric"] is not None
+                and best["campaign"] != worst["campaign"]):
+            gap_pct = abs(worst["ranking_metric"] - best["ranking_metric"]) / abs(best["ranking_metric"]) * 100 \
+                if best["ranking_metric"] else 0
+            if gap_pct >= 25:
+                test_amount = worst["spend"] * 0.15
+                items.append({
+                    "priority": 2, "impact": test_amount, "badge": "🟢",
+                    "title": f"Reallocate budget: {best['campaign']} over {worst['campaign']}",
+                    "detail": f"A {gap_pct:.0f}% efficiency gap between campaigns — worth testing a shift "
+                              f"of roughly {money(test_amount, brand['currency'])} from {worst['campaign']} "
+                              f"to {best['campaign']}.",
+                })
+
+    cross_platform = metrics.cross_platform_reallocation_view(df, brand)
+    if cross_platform:
+        cp_best, cp_worst = cross_platform[0], cross_platform[-1]
+        if (cp_best["ranking_metric"] is not None and cp_worst["ranking_metric"] is not None
+                and cp_best["platform"] != cp_worst["platform"]):
+            cp_gap_pct = abs(cp_worst["ranking_metric"] - cp_best["ranking_metric"]) / abs(cp_best["ranking_metric"]) * 100 \
+                if cp_best["ranking_metric"] else 0
+            if cp_gap_pct >= 25:
+                cp_test_amount = cp_worst["spend"] * 0.15
+                items.append({
+                    "priority": 2, "impact": cp_test_amount, "badge": "🟢",
+                    "title": f"Shift budget toward {cp_best['platform']} over {cp_worst['platform']}",
+                    "detail": f"A {cp_gap_pct:.0f}% platform-level efficiency gap — worth testing a shift "
+                              f"of roughly {money(cp_test_amount, brand['currency'])} toward {cp_best['platform']}.",
+                })
+
+    waste = metrics.keyword_waste_candidates(camp_scoped)
+    if waste:
+        total_waste_spend = sum(w["spend"] for w in waste)
+        items.append({
+            "priority": 1, "impact": total_waste_spend, "badge": "🟡",
+            "title": f"{len(waste)} keyword(s) burning spend with no conversions",
+            "detail": f"{money(total_waste_spend, brand['currency'])} of spend this period with a "
+                      f"95%-confidence best case still below this account's own typical conversion rate. "
+                      f"Biggest: {waste[0]['keyword']} ({money(waste[0]['spend'], brand['currency'])}).",
+        })
+
+    anomaly_metric = "roas" if brand["business_model"] == "transactional" else "cpa"
+    flags = metrics.detect_anomalies(full_daily, anomaly_metric, z_thresh=2.0) if len(full_daily) >= 5 else []
+    if flags:
+        worst_flag = max(flags, key=lambda f: abs(f["z_score"]))
+        d = pd.Timestamp(worst_flag["date"]).date().isoformat()
+        items.append({
+            "priority": 1, "impact": 0.0, "badge": "🟡",
+            "title": f"{len(flags)} statistically unusual day(s) in {anomaly_metric.upper()}",
+            "detail": f"Most extreme: {d} ({worst_flag['pct_change']:+.0f}% day-over-day, "
+                      f"z={worst_flag['z_score']}).",
+        })
+
+    items.sort(key=lambda x: (x["priority"], -x["impact"]))
+    return items
+
+
 # --------------------------------------------------------------- sidebar --
 
 st.sidebar.title("PPC Intelligence")
@@ -304,6 +404,34 @@ with st.sidebar.expander("+ New brand", expanded=(len(brands) == 0)):
 
 if not brands:
     st.info("Create a brand in the sidebar to get started.")
+    st.stop()
+
+if len(brands) > 1 and st.sidebar.checkbox("🗞️ Portfolio view (all brands)"):
+    st.title("Portfolio digest — all brands")
+    st.caption("The same ranked signals as each brand's own Digest tab, one row per brand, so you can scan "
+               "the whole portfolio without switching brands one at a time. Click into a brand's own Digest "
+               "tab for the full ranked list — this shows only the single highest-priority signal per brand.")
+    badge_rank = {"🔴": 0, "🟡": 1, "🟢": 2, "": 3}
+    portfolio_rows = []
+    for b in brands:
+        b_rows = db.rows_for_brand(b["id"])
+        if not b_rows:
+            portfolio_rows.append({"_sort": 3, "Brand": b["name"], "Status": "No data yet", "Top signal": "—"})
+            continue
+        b_df = metrics.rows_to_df(b_rows)
+        b_items = compute_digest_items(b_df, brand_dict(b))
+        if not b_items:
+            portfolio_rows.append({"_sort": 3, "Brand": b["name"], "Status": "🟢 Nothing urgent", "Top signal": "—"})
+        else:
+            top = b_items[0]
+            portfolio_rows.append({"_sort": badge_rank.get(top["badge"], 3), "Brand": b["name"],
+                                    "Status": f"{top['badge']} {top['title']}", "Top signal": top["detail"]})
+    portfolio_rows.sort(key=lambda r: r["_sort"])
+    for r in portfolio_rows:
+        with st.container(border=True):
+            st.markdown(f"**{r['Brand']}** — {md_safe(r['Status'])}")
+            if r["Top signal"] != "—":
+                st.caption(md_safe(r["Top signal"]))
     st.stop()
 
 selected_name = st.sidebar.selectbox("Brand", list(brand_names.keys()))
@@ -487,106 +615,16 @@ with tab_digest:
         st.info("No data yet — import a report first.")
     else:
         df = metrics.rows_to_df(all_rows)
-        max_d = df["date"].max().date()
         n = 7
-        cur_start, cur_end = max_d - timedelta(days=n - 1), max_d
-        base_start, base_end = cur_start - timedelta(days=n), cur_start - timedelta(days=1)
         st.caption(f"Last {n} days vs. the {n} before that, synthesized from every other tab and ranked "
                    f"so the highest-priority thing is first — not a new analysis, a ranked reading of what's "
                    f"already computed elsewhere. Check the relevant tab for full detail on any item below.")
 
-        compare = metrics.compare_periods(df, cur_start, cur_end, base_start, base_end)
-        camp_scoped = df[(df["date"] >= pd.Timestamp(cur_start)) & (df["date"] <= pd.Timestamp(cur_end))]
-        camp_agg = metrics.aggregate(camp_scoped, by=["campaign"])
-        full_daily = metrics.aggregate(df, by=["date"])
-
-        items = []  # {priority: 0=critical/1=watch/2=opportunity, impact: float (secondary sort), badge, title, detail}
-
-        for ins in metrics.generate_insights(camp_agg, brand, compare):
-            priority = {"critical": 0, "watch": 1, "scale": 2}.get(ins.severity, 1)
-            detail = ins.detail + (f" → {ins.suggested_action}" if ins.suggested_action else "")
-            items.append({"priority": priority, "impact": 0.0,
-                           "badge": {"critical": "🔴", "watch": "🟡", "scale": "🟢"}.get(ins.severity, ""),
-                           "title": ins.title, "detail": detail})
-
-        forecast_metric = "roas" if brand["business_model"] == "transactional" else "cpa"
-        forecast = metrics.forecast_trend(full_daily, forecast_metric)
-        if forecast:
-            target_val = brand["target_cpa"] if forecast_metric == "cpa" else brand["target_roas"]
-            if target_val:
-                fmt_val = (lambda v: money(v, brand["currency"])) if forecast_metric == "cpa" else ratio
-                breaches = (forecast["projected_value_end"] > target_val) if forecast_metric == "cpa" \
-                    else (forecast["projected_value_end"] < target_val)
-                if breaches:
-                    items.append({
-                        "priority": 0, "impact": 0.0, "badge": "🔴",
-                        "title": f"Blended {forecast_metric.upper()} trending toward a target breach",
-                        "detail": f"At this trend, projected {forecast_metric.upper()} in 7 days "
-                                  f"({fmt_val(forecast['projected_value_end'])}) would be past your target "
-                                  f"({fmt_val(target_val)}) — worth acting before it gets there.",
-                    })
-
-        realloc = metrics.budget_reallocation_view(df, camp_agg, brand)
-        if realloc:
-            best, worst = realloc[0], realloc[-1]
-            if (best["ranking_metric"] is not None and worst["ranking_metric"] is not None
-                    and best["campaign"] != worst["campaign"]):
-                gap_pct = abs(worst["ranking_metric"] - best["ranking_metric"]) / abs(best["ranking_metric"]) * 100 \
-                    if best["ranking_metric"] else 0
-                if gap_pct >= 25:
-                    test_amount = worst["spend"] * 0.15
-                    items.append({
-                        "priority": 2, "impact": test_amount, "badge": "🟢",
-                        "title": f"Reallocate budget: {best['campaign']} over {worst['campaign']}",
-                        "detail": f"A {gap_pct:.0f}% efficiency gap between campaigns — worth testing a shift "
-                                  f"of roughly {money(test_amount, brand['currency'])} from {worst['campaign']} "
-                                  f"to {best['campaign']}.",
-                    })
-
-        cross_platform = metrics.cross_platform_reallocation_view(df, brand)
-        if cross_platform:
-            cp_best, cp_worst = cross_platform[0], cross_platform[-1]
-            if (cp_best["ranking_metric"] is not None and cp_worst["ranking_metric"] is not None
-                    and cp_best["platform"] != cp_worst["platform"]):
-                cp_gap_pct = abs(cp_worst["ranking_metric"] - cp_best["ranking_metric"]) / abs(cp_best["ranking_metric"]) * 100 \
-                    if cp_best["ranking_metric"] else 0
-                if cp_gap_pct >= 25:
-                    cp_test_amount = cp_worst["spend"] * 0.15
-                    items.append({
-                        "priority": 2, "impact": cp_test_amount, "badge": "🟢",
-                        "title": f"Shift budget toward {cp_best['platform']} over {cp_worst['platform']}",
-                        "detail": f"A {cp_gap_pct:.0f}% platform-level efficiency gap — worth testing a shift "
-                                  f"of roughly {money(cp_test_amount, brand['currency'])} toward {cp_best['platform']}.",
-                    })
-
-        waste = metrics.keyword_waste_candidates(camp_scoped)
-        if waste:
-            total_waste_spend = sum(w["spend"] for w in waste)
-            items.append({
-                "priority": 1, "impact": total_waste_spend, "badge": "🟡",
-                "title": f"{len(waste)} keyword(s) burning spend with no conversions",
-                "detail": f"{money(total_waste_spend, brand['currency'])} of spend this period with a "
-                          f"95%-confidence best case still below this account's own typical conversion rate. "
-                          f"Biggest: {waste[0]['keyword']} ({money(waste[0]['spend'], brand['currency'])}).",
-            })
-
-        anomaly_metric = "roas" if brand["business_model"] == "transactional" else "cpa"
-        flags = metrics.detect_anomalies(full_daily, anomaly_metric, z_thresh=2.0) if len(full_daily) >= 5 else []
-        if flags:
-            worst_flag = max(flags, key=lambda f: abs(f["z_score"]))
-            d = pd.Timestamp(worst_flag["date"]).date().isoformat()
-            items.append({
-                "priority": 1, "impact": 0.0, "badge": "🟡",
-                "title": f"{len(flags)} statistically unusual day(s) in {anomaly_metric.upper()}",
-                "detail": f"Most extreme: {d} ({worst_flag['pct_change']:+.0f}% day-over-day, "
-                          f"z={worst_flag['z_score']}).",
-            })
-
+        items = compute_digest_items(df, brand, n)
         if not items:
             st.success("Nothing urgent this week — no threshold breaches, forecast warnings, reallocation "
                        "gaps, keyword waste, or anomalies detected.")
         else:
-            items.sort(key=lambda x: (x["priority"], -x["impact"]))
             shown = items[:5]
             for i, it in enumerate(shown, 1):
                 with st.container(border=True):
