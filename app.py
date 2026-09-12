@@ -676,20 +676,29 @@ with tab_dash:
             }
             econ = metrics.brand_unit_economics(totals, brand)
 
-            cols = st.columns(6)
-            cols[0].metric("Spend", money(totals["spend"], brand["currency"]))
-            cols[1].metric("Conversions", f"{totals['conversions']:,.0f}")
+            # Six st.metric tiles in one st.columns(6) row clip both the label
+            # ("Payback (orders to break even)") and long money/count values
+            # ("$35,278.58", "1,574") at normal window widths — st.metric is
+            # built for short numbers, not this much text in a sixth of the
+            # row. A 3-wide x 2-row grid gives each tile double the room,
+            # same fix already used for the Insights tab's period-over-
+            # period row.
+            krow1 = st.columns(3)
+            krow2 = st.columns(3)
+            kcols = [krow1[0], krow1[1], krow1[2], krow2[0], krow2[1], krow2[2]]
+            kcols[0].metric("Spend", money(totals["spend"], brand["currency"]))
+            kcols[1].metric("Conversions", f"{totals['conversions']:,.0f}")
             if brand["business_model"] == "transactional":
-                cols[2].metric("ROAS", ratio(econ["roas"]))
-                cols[3].metric("iROAS floor", ratio(econ["iroas_floor"]) if econ["iroas_floor"] else "—")
+                kcols[2].metric("ROAS", ratio(econ["roas"]))
+                kcols[3].metric("iROAS floor", ratio(econ["iroas_floor"]) if econ["iroas_floor"] else "—")
             else:
-                cols[2].metric("CAC / CPA", money(econ["cac"], brand["currency"]))
-                cols[3].metric("Target CPA", money(brand["target_cpa"], brand["currency"]))
-            cols[4].metric("LTV : CAC", ratio(econ["ltv_cac"]) if econ["ltv_cac"] else "—")
+                kcols[2].metric("CAC / CPA", money(econ["cac"], brand["currency"]))
+                kcols[3].metric("Target CPA", money(brand["target_cpa"], brand["currency"]))
+            kcols[4].metric("LTV : CAC", ratio(econ["ltv_cac"]) if econ["ltv_cac"] else "—")
             payback_label = f"{econ['payback_orders']:.1f} orders" if econ["payback_orders"] else "—"
-            cols[5].metric("Payback (orders to break even)", payback_label,
-                            help="Repeat orders needed for cumulative contribution margin to recover CAC. "
-                                 "Not a time period — that needs a repeat-purchase-cadence input this prototype doesn't collect yet.")
+            kcols[5].metric("Payback (orders to break even)", payback_label,
+                             help="Repeat orders needed for cumulative contribution margin to recover CAC. "
+                                  "Not a time period — that needs a repeat-purchase-cadence input this prototype doesn't collect yet.")
 
             st.markdown("#### Trend")
             daily = metrics.aggregate(scoped, by=["date"])
@@ -1272,7 +1281,13 @@ with tab_recon:
                 recon["platform_roas"] = (recon["platform_claimed"] / recon["spend"]).where(recon["spend"] > 0)
                 recon = recon.sort_values("actual_revenue", ascending=False)
 
-                t1, t2, t3, t4 = st.columns(4)
+                # Same truncation risk as the Dashboard KPI row this replaces the pattern of: 4
+                # narrow st.metric columns clip a long label like "True ROI (actual revenue ÷
+                # spend)" and a long money value like "$35,278.58" alike. 2x2 gives each tile
+                # double the room.
+                trow1 = st.columns(2)
+                trow2 = st.columns(2)
+                t1, t2, t3, t4 = trow1[0], trow1[1], trow2[0], trow2[1]
                 t1.metric("Actual revenue (orders)", money(recon["actual_revenue"].sum(), brand["currency"]))
                 t2.metric("Platform-claimed revenue", money(recon["platform_claimed"].sum(), brand["currency"]))
                 total_delta_pct = (recon["actual_revenue"].sum() - recon["platform_claimed"].sum()) / recon["platform_claimed"].sum() * 100 if recon["platform_claimed"].sum() else None
