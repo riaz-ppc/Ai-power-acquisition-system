@@ -8,4 +8,3 @@ facebook-business==26.0.1
 pyyaml==6.0.3
 psycopg2-binary==2.9.13
 python-dotenv==1.0.1
-streamlit-cookies-manager==0.2.0
