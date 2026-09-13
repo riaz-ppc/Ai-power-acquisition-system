@@ -299,17 +299,21 @@ def rename_campaign(brand_id: int, platform: str, old_name: str, new_name: str) 
             return cur.rowcount
 
 
-def apply_actual_revenue(brand_id: int, platform: str, campaign: str,
-                          amount_by_date: dict[str, float]) -> int:
+def apply_actual_revenue(brand_id: int, updates: list[tuple[str, str, str, float]]) -> int:
     """
-    Overwrites performance_rows.conversion_value for one campaign, on
-    exactly the dates given, with real order revenue — for when the
-    platform never tracked a conversion value at all (routine for
-    lead-gen accounts) and the viewer has real revenue from a matched
-    order import instead. Only ever called after the viewer has reviewed
-    the reconciliation table and explicitly confirmed — this replaces
-    the platform's own number, so it's a deliberate action, not a
-    background sync.
+    Overwrites performance_rows.conversion_value with real order revenue,
+    for every (platform, campaign, date, amount) row in `updates` — for
+    when the platform never tracked a conversion value at all (routine
+    for lead-gen accounts) and the viewer has real revenue from a
+    matched order import instead. Only ever called after the viewer has
+    reviewed the reconciliation table and explicitly confirmed — this
+    replaces the platform's own number, so it's a deliberate action, not
+    a background sync.
+
+    Takes every campaign's updates in one call (one connection checkout)
+    rather than being called once per campaign — a reconciliation across
+    many campaigns and dates used to reopen a pooled connection for each
+    campaign individually.
 
     Scoped narrowly on purpose: only rows already at campaign level
     (ad_set/ad/keyword-level rows for the same campaign+date are left
@@ -323,7 +327,7 @@ def apply_actual_revenue(brand_id: int, platform: str, campaign: str,
     updated = 0
     with get_conn() as conn:
         with conn.cursor() as cur:
-            for order_date, amount in amount_by_date.items():
+            for platform, campaign, order_date, amount in updates:
                 cur.execute(
                     "UPDATE performance_rows SET conversion_value=%s "
                     "WHERE brand_id=%s AND platform=%s AND campaign=%s AND date=%s "
