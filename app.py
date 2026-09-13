@@ -97,6 +97,60 @@ def _read_upload_to_frames(f) -> list[tuple[str, pd.DataFrame]]:
 
 st.set_page_config(page_title="PPC Acquisition Intelligence", layout="wide")
 
+# Theme: colors live in .streamlit/config.toml (Streamlit's own [theme]
+# section only covers base/primary/background/text colors + a generic
+# font keyword — not real typefaces or component-level styling). This
+# fills the rest in: the same Manrope/IBM Plex Sans pairing already used
+# for the shareable client report (src/report_html.py), so the two
+# surfaces feel like one product, plus card-style KPI tiles, a colored
+# tab underline, and softened corners on buttons/alerts/dataframes.
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
+h1, h2, h3, [data-testid="stMetricValue"] { font-family: 'Manrope', sans-serif; font-weight: 800; letter-spacing: -0.01em; }
+
+/* KPI tiles: st.metric as a small elevated card instead of bare text */
+[data-testid="stMetric"] {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    padding: 1rem 1.1rem;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+}
+[data-testid="stMetricLabel"] { font-weight: 500; opacity: 0.75; }
+
+/* Tabs: a colored active underline instead of the default thin grey one */
+[data-testid="stTabs"] button[role="tab"] { font-weight: 600; padding: 0.5rem 1rem; }
+[data-testid="stTabs"] button[aria-selected="true"] {
+    color: #FF6B4A;
+    border-bottom: 3px solid #FF6B4A;
+}
+[data-testid="stTabs"] [data-baseweb="tab-highlight"] { background-color: #FF6B4A; }
+
+/* Buttons: accent fill on primary actions, a gentle lift on hover */
+.stButton > button, .stDownloadButton > button {
+    border-radius: 8px;
+    font-weight: 600;
+    transition: transform 0.05s ease-in-out;
+}
+.stButton > button:hover, .stDownloadButton > button:hover { transform: translateY(-1px); }
+button[kind="primary"] { background-color: #FF6B4A; border-color: #FF6B4A; }
+button[kind="primary"]:hover { background-color: #ff7f61; border-color: #ff7f61; }
+
+/* Softer corners on containers, alerts, and dataframes so the page reads
+   as one consistent surface rather than a stack of default widgets */
+[data-testid="stExpander"], [data-testid="stAlert"], [data-testid="stDataFrame"],
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 10px;
+}
+
+/* Sidebar: a faint divider so it reads as a distinct panel, not a grey slab */
+[data-testid="stSidebar"] { border-right: 1px solid rgba(255,255,255,0.08); }
+</style>
+""", unsafe_allow_html=True)
+
 
 # Query param (not a cookie) that carries the login token across a page
 # reload — see _check_password for why.
@@ -1372,7 +1426,7 @@ with tab_recon:
                            "platform file later resets conversion_value back to whatever the platform reports.")
                 campaign_to_platform = {c: p for p, cs in campaigns_by_platform.items() for c in cs}
                 if st.button("Merge conversion_value = actual_revenue"):
-                    total_updated = 0
+                    updates = []
                     skipped = []
                     for campaign in recon["campaign"]:
                         platform = campaign_to_platform.get(campaign)
@@ -1381,7 +1435,11 @@ with tab_recon:
                             continue
                         camp_orders = odf[odf["matched_campaign"] == campaign]
                         amount_by_date = camp_orders.groupby("order_date")["amount"].sum().to_dict()
-                        total_updated += db.apply_actual_revenue(brand_id, platform, campaign, amount_by_date)
+                        updates.extend(
+                            (platform, campaign, order_date, amount)
+                            for order_date, amount in amount_by_date.items()
+                        )
+                    total_updated = db.apply_actual_revenue(brand_id, updates)
                     msg = (f"Updated {total_updated} row(s) — conversion_value now reflects real order "
                            f"revenue wherever the platform reported none.")
                     if skipped:

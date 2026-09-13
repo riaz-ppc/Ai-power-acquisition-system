@@ -5,3 +5,15 @@ enableXsrfProtection = true
 
 [browser]
 gatherUsageStats = false
+
+# Deep ink-navy base with a coral-orange accent — distinct from the
+# generic blue-on-black look of most dashboard templates, and energetic
+# enough to fit a pay-per-click / performance-marketing tool. Paired
+# with the Manrope/IBM Plex Sans fonts injected in app.py.
+[theme]
+base = "dark"
+primaryColor = "#FF6B4A"
+backgroundColor = "#0B1120"
+secondaryBackgroundColor = "#131B2E"
+textColor = "#F1F4FA"
+font = "sans serif"
