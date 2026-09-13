@@ -6,6 +6,8 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import zipfile
@@ -96,26 +98,48 @@ def _read_upload_to_frames(f) -> list[tuple[str, pd.DataFrame]]:
 st.set_page_config(page_title="PPC Acquisition Intelligence", layout="wide")
 
 
+# Query param (not a cookie) that carries the login token across a page
+# reload — see _check_password for why.
+AUTH_QUERY_PARAM = "ppc_auth"
+
+
+def _auth_token(password: str) -> str:
+    # Keyed by the real password so the token is only ever valid for
+    # whatever APP_PASSWORD currently is — the URL carries this derived
+    # token, never the password itself, and rotating APP_PASSWORD
+    # invalidates every outstanding link automatically.
+    return hmac.new(password.encode(), b"ppc-intelligence-auth-v1", hashlib.sha256).hexdigest()
+
+
 def _check_password() -> bool:
     """Gate the whole app behind a single shared password, set via the
     APP_PASSWORD environment variable on the deployment. Local dev with no
     APP_PASSWORD set stays open, so this never gets in the way of running
     it on your own machine.
 
-    Session-only, deliberately: an earlier version persisted login across
-    browser reloads via a signed cookie (streamlit_cookies_manager). That
-    component's cookie-read is async (mounts, then reports "ready" on a
-    later rerun), and on Streamlit Community Cloud that handshake was
-    landing sessions in the authenticated branch without ever actually
-    matching a real cookie — a silent full bypass of the password gate.
-    Checking only st.session_state means a full page reload re-prompts
-    for the password (a real usability cost), but it fails closed: there
-    is no code path here that can mark a session authenticated other than
-    typing the correct password in *this* session."""
+    Login persists across a page reload via a token in the URL's query
+    string (st.query_params), not a cookie. An earlier version used a
+    signed cookie via a third-party component (streamlit_cookies_manager)
+    whose cookie-read is async — mounts, then reports "ready" on a later
+    rerun — and on Streamlit Community Cloud that handshake was landing
+    sessions in the authenticated branch without ever actually matching a
+    real cookie: a silent full bypass of the password gate. Query params
+    are part of the very first request, available synchronously with no
+    "is it ready yet?" window, so that failure mode can't recur here.
+
+    Trade-off, deliberately accepted: the token is a bearer credential
+    embedded in the URL — anyone who gets this exact URL (browser
+    history, a pasted link, a screenshot) is in without ever knowing the
+    password, until APP_PASSWORD is rotated. Don't share/paste this app's
+    URL while logged in if that's a concern."""
     required = os.environ.get("APP_PASSWORD")
     if not required:
         return True
     if st.session_state.get("authenticated"):
+        return True
+
+    if st.query_params.get(AUTH_QUERY_PARAM) == _auth_token(required):
+        st.session_state["authenticated"] = True
         return True
 
     st.title("PPC Intelligence")
@@ -123,6 +147,7 @@ def _check_password() -> bool:
     if pw:
         if pw == required:
             st.session_state["authenticated"] = True
+            st.query_params[AUTH_QUERY_PARAM] = _auth_token(required)
             return True
         else:
             st.error("Incorrect password.")
@@ -131,7 +156,16 @@ def _check_password() -> bool:
 
 def _log_out():
     st.session_state["authenticated"] = False
-    st.rerun()
+    if AUTH_QUERY_PARAM in st.query_params:
+        del st.query_params[AUTH_QUERY_PARAM]
+    # Deliberately no st.rerun() here: removing the query param is itself
+    # a message that still needs to reach the browser and update the
+    # address bar — an immediate rerun races that message (same failure
+    # shape as the old cookie-write timing bug). Rendering a message and
+    # st.stop()-ing in THIS run gives the removal a chance to actually
+    # land; the next reload then genuinely finds no token in the URL.
+    st.info("Logged out. Reload the page to sign in again.")
+    st.stop()
 
 
 if not _check_password():
