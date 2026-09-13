@@ -6,8 +6,6 @@ Run with:  streamlit run app.py
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import zipfile
@@ -17,7 +15,6 @@ from io import BytesIO, StringIO
 import altair as alt
 import pandas as pd
 import streamlit as st
-from streamlit_cookies_manager import CookieManager
 
 from src import db, mapping, metrics, normalize, orders, report
 
@@ -99,47 +96,26 @@ def _read_upload_to_frames(f) -> list[tuple[str, pd.DataFrame]]:
 st.set_page_config(page_title="PPC Acquisition Intelligence", layout="wide")
 
 
-# No prefix on the CookieManager (see _log_out's comment on why) — this
-# name just needs to be distinctive enough not to collide with anything
-# else on this app's own domain.
-AUTH_COOKIE_NAME = "ppc_intelligence_auth_token"
-AUTH_COOKIE_TTL_DAYS = 30
-
-
-def _auth_token(password: str) -> str:
-    # Keyed by the real password so the token is only ever valid for
-    # whatever APP_PASSWORD currently is — the cookie carries this
-    # derived token, never the password itself, so a stolen cookie can't
-    # be turned back into the password, and rotating APP_PASSWORD
-    # invalidates every outstanding cookie automatically.
-    return hmac.new(password.encode(), b"ppc-intelligence-auth-v1", hashlib.sha256).hexdigest()
-
-
 def _check_password() -> bool:
     """Gate the whole app behind a single shared password, set via the
-    APP_PASSWORD environment variable on the deployment (Render, not this
-    repo — never hardcoded, never committed). Local dev with no
+    APP_PASSWORD environment variable on the deployment. Local dev with no
     APP_PASSWORD set stays open, so this never gets in the way of running
     it on your own machine.
 
-    st.session_state alone doesn't survive a browser reload — Streamlit
-    opens a brand-new session on every page reload, which is why the
-    password used to be asked for every time. A signed cookie (holding
-    only an HMAC token derived from the password, not the password
-    itself) extends that across reloads for AUTH_COOKIE_TTL_DAYS."""
+    Session-only, deliberately: an earlier version persisted login across
+    browser reloads via a signed cookie (streamlit_cookies_manager). That
+    component's cookie-read is async (mounts, then reports "ready" on a
+    later rerun), and on Streamlit Community Cloud that handshake was
+    landing sessions in the authenticated branch without ever actually
+    matching a real cookie — a silent full bypass of the password gate.
+    Checking only st.session_state means a full page reload re-prompts
+    for the password (a real usability cost), but it fails closed: there
+    is no code path here that can mark a session authenticated other than
+    typing the correct password in *this* session."""
     required = os.environ.get("APP_PASSWORD")
     if not required:
         return True
     if st.session_state.get("authenticated"):
-        return True
-
-    cookies = CookieManager()
-    if not cookies.ready():
-        st.stop()
-    cookies._default_expiry = datetime.now() + timedelta(days=AUTH_COOKIE_TTL_DAYS)
-
-    if cookies.get(AUTH_COOKIE_NAME) == _auth_token(required):
-        st.session_state["authenticated"] = True
         return True
 
     st.title("PPC Intelligence")
@@ -147,15 +123,6 @@ def _check_password() -> bool:
     if pw:
         if pw == required:
             st.session_state["authenticated"] = True
-            cookies[AUTH_COOKIE_NAME] = _auth_token(required)
-            # Deliberately no st.rerun() here: the cookie write is a
-            # component render that still needs to reach the browser and
-            # actually run its JS (document.cookie = ...) — an immediate
-            # rerun tears that component down first, so the cookie never
-            # lands. Falling through and letting this same run continue
-            # (the caller proceeds past _check_password() normally) gives
-            # it that chance; the next real reload then finds the cookie.
-            cookies.save()
             return True
         else:
             st.error("Incorrect password.")
@@ -163,27 +130,72 @@ def _check_password() -> bool:
 
 
 def _log_out():
-    # Same reasoning as the login path: no st.rerun() right after
-    # cookies.save() here either, or the delete-cookie component gets
-    # torn down before its JS actually runs, the cookie survives, and
-    # the very next run's cookie check silently logs the same browser
-    # straight back in. Rendering a message and st.stop()-ing in THIS
-    # run gives the delete a chance to really happen; the next reload
-    # (manual, since there's nothing left running to auto-rerun into)
-    # then genuinely finds no valid cookie.
-    cookies = CookieManager()
-    if cookies.ready() and AUTH_COOKIE_NAME in cookies:
-        del cookies[AUTH_COOKIE_NAME]
-        cookies.save()
     st.session_state["authenticated"] = False
-    st.info("Logged out. Reload the page to sign in again.")
-    st.stop()
+    st.rerun()
 
 
 if not _check_password():
     st.stop()
 
 db.init_db()
+
+# ------------------------------------------------------------------ cache --
+# Streamlit reruns this whole script on every widget interaction, and every
+# tab body below runs on every rerun regardless of which tab is visible —
+# so an uncached db.rows_for_brand(brand_id) was hitting Postgres with a
+# brand-new connection 6-8 times (once per tab that needs it) for the exact
+# same rows on every single click anywhere in the app. Caching these reads
+# turns that into one real query per rerun (the rest are cache hits) and
+# zero queries on reruns where nothing changed. TTL is just a safety net —
+# every write below clears the cache immediately so nothing goes stale.
+_CACHE_TTL = 300
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def cached_rows_for_brand(brand_id: int, start: str | None = None, end: str | None = None):
+    return db.rows_for_brand(brand_id, start, end)
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def cached_orders_for_brand(brand_id: int, start: str | None = None, end: str | None = None):
+    return db.orders_for_brand(brand_id, start, end)
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def cached_list_brands():
+    return db.list_brands()
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def cached_list_tests(brand_id: int):
+    return db.list_tests(brand_id)
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def cached_unmatched_raw_campaigns(brand_id: int):
+    return db.unmatched_raw_campaigns(brand_id)
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def cached_list_imports(brand_id: int):
+    return db.list_imports(brand_id)
+
+
+def invalidate_brand_data_cache():
+    """Call right after any write to performance_rows/orders/imports/tests
+    so the very next read (typically the st.rerun() a few lines later)
+    reflects it, instead of waiting out the TTL."""
+    cached_rows_for_brand.clear()
+    cached_orders_for_brand.clear()
+    cached_list_tests.clear()
+    cached_unmatched_raw_campaigns.clear()
+    cached_list_imports.clear()
+
+
+def invalidate_brands_cache():
+    """Call after create_brand/update_brand — brands list/order/fields change."""
+    cached_list_brands.clear()
+
 
 CURRENCIES = ["USD", "GBP", "BDT", "EUR"]
 # Markets with a stocked seasonal-calendar entry in metrics.market_seasons();
@@ -362,7 +374,7 @@ def compute_digest_items(df: pd.DataFrame, brand: dict, n: int = 7) -> list[dict
 st.sidebar.title("PPC Intelligence")
 if os.environ.get("APP_PASSWORD") and st.sidebar.button("Log out"):
     _log_out()
-brands = db.list_brands()
+brands = cached_list_brands()
 brand_names = {b["name"]: b["id"] for b in brands}
 
 with st.sidebar.expander("❓ How this app works", expanded=(len(brands) == 0)):
@@ -413,6 +425,7 @@ with st.sidebar.expander("+ New brand", expanded=(len(brands) == 0)):
                     ltv=ltv or None, target_roas=target_roas, target_cpa=target_cpa,
                     target_payback_days=target_payback_days or None,
                 )
+                invalidate_brands_cache()
                 st.success(f"Created {name}")
                 st.rerun()
 
@@ -428,7 +441,7 @@ if len(brands) > 1 and st.sidebar.checkbox("🗞️ Portfolio view (all brands)"
     badge_rank = {"🔴": 0, "🟡": 1, "🟢": 2, "": 3}
     portfolio_rows = []
     for b in brands:
-        b_rows = db.rows_for_brand(b["id"])
+        b_rows = cached_rows_for_brand(b["id"])
         if not b_rows:
             portfolio_rows.append({"_sort": 3, "Brand": b["name"], "Status": "No data yet", "Top signal": "—"})
             continue
@@ -543,6 +556,7 @@ with tab_import:
                                     notes="manual mapping: " + "; ".join(m_result.warnings),
                                 )
                                 db.insert_rows(import_id, brand_id, m_result.rows)
+                                invalidate_brand_data_cache()
                                 st.success(f"Imported {m_result.row_count} rows as '{platform_label}'.")
                                 st.rerun()
                     continue
@@ -593,6 +607,7 @@ with tab_import:
                         notes="; ".join(result.warnings),
                     )
                     db.insert_rows(import_id, brand_id, rows_to_import)
+                    invalidate_brand_data_cache()
                     st.success(f"Imported {len(rows_to_import)} rows"
                                + (" (old rows in this date range were replaced)." if replace else "."))
                     st.rerun()
@@ -624,7 +639,7 @@ with tab_import:
 
 with tab_digest:
     st.subheader(f"Weekly digest — {selected_name}")
-    all_rows = db.rows_for_brand(brand_id)
+    all_rows = cached_rows_for_brand(brand_id)
     if not all_rows:
         st.info("No data yet — import a report first.")
     else:
@@ -652,7 +667,7 @@ with tab_digest:
 
 with tab_dash:
     st.subheader(f"Dashboard — {selected_name}")
-    all_rows = db.rows_for_brand(brand_id)
+    all_rows = cached_rows_for_brand(brand_id)
     if not all_rows:
         st.info("No data yet — import a report first.")
     else:
@@ -782,7 +797,7 @@ with tab_dash:
 
 with tab_insights:
     st.subheader(f"Insights — {selected_name}")
-    all_rows = db.rows_for_brand(brand_id)
+    all_rows = cached_rows_for_brand(brand_id)
     if not all_rows:
         st.info("No data yet — import a report first.")
     else:
@@ -1110,11 +1125,12 @@ with tab_tests:
                     variant_b_label=b_label, variant_b_campaigns=json.dumps([c.strip() for c in b_campaigns.splitlines() if c.strip()]),
                     started_at=date.today().isoformat(), status="running",
                 )
+                invalidate_brand_data_cache()
                 st.success("Test saved.")
                 st.rerun()
 
-    tests = db.list_tests(brand_id)
-    all_rows = db.rows_for_brand(brand_id)
+    tests = cached_list_tests(brand_id)
+    all_rows = cached_rows_for_brand(brand_id)
     df = metrics.rows_to_df(all_rows) if all_rows else pd.DataFrame()
 
     if not tests:
@@ -1188,10 +1204,11 @@ with tab_recon:
                     unmapped_columns=o_result.unmapped_columns,
                 )
                 db.insert_orders(import_id, brand_id, o_result.rows)
+                invalidate_brand_data_cache()
                 st.success(f"Imported {o_result.row_count} orders.")
                 st.rerun()
 
-    all_orders_unfiltered = db.orders_for_brand(brand_id)
+    all_orders_unfiltered = cached_orders_for_brand(brand_id)
     if not all_orders_unfiltered:
         st.info("No orders imported yet — drop an order/sales export above to get started.")
     else:
@@ -1209,8 +1226,8 @@ with tab_recon:
             st.info("Pick an end date to continue.")
         else:
             recon_start, recon_end = str(recon_range[0]), str(recon_range[1])
-            all_orders = db.orders_for_brand(brand_id, recon_start, recon_end)
-            perf_rows = db.rows_for_brand(brand_id, recon_start, recon_end)
+            all_orders = cached_orders_for_brand(brand_id, recon_start, recon_end)
+            perf_rows = cached_rows_for_brand(brand_id, recon_start, recon_end)
 
             st.markdown("---")
             st.markdown("#### Match campaign names")
@@ -1218,7 +1235,7 @@ with tab_recon:
                        "names exactly. Every suggestion below is a guess — confirm or correct each one; "
                        "nothing is used for reconciliation until you save.")
 
-            unmatched = db.unmatched_raw_campaigns(brand_id)
+            unmatched = cached_unmatched_raw_campaigns(brand_id)
             campaigns_by_platform: dict[str, list[str]] = {}
             for r in perf_rows:
                 campaigns_by_platform.setdefault(r["platform"], [])
@@ -1252,6 +1269,7 @@ with tab_recon:
                         choices[raw] = st.selectbox(label, options, index=default_idx, key=f"match_{raw}")
                     if st.form_submit_button("Save matches"):
                         db.set_campaign_matches(brand_id, choices)
+                        invalidate_brand_data_cache()
                         st.success("Saved.")
                         st.rerun()
 
@@ -1334,6 +1352,7 @@ with tab_recon:
                            f"revenue wherever the platform reported none.")
                     if skipped:
                         msg += f" Skipped (couldn't tell which platform): {', '.join(skipped)}."
+                    invalidate_brand_data_cache()
                     st.success(msg)
                     st.rerun()
 
@@ -1361,12 +1380,13 @@ with tab_export:
             db.update_brand(brand_id, country=country, margin_pct=margin_pct or None, aov=aov or None, ltv=ltv or None,
                              target_roas=target_roas or None, target_cpa=target_cpa or None,
                              target_payback_days=target_payback_days or None)
+            invalidate_brands_cache()
             st.success("Saved.")
             st.rerun()
 
     st.markdown("---")
     st.write("**Imports on file**")
-    imports = db.list_imports(brand_id)
+    imports = cached_list_imports(brand_id)
     if imports:
         idf = pd.DataFrame([dict(i) for i in imports])[
             ["id", "platform", "level", "filename", "date_start", "date_end", "row_count", "status", "imported_at"]
@@ -1375,6 +1395,7 @@ with tab_export:
         del_id = st.number_input("Import ID to delete", min_value=0, value=0, step=1)
         if st.button("Delete import") and del_id:
             if db.delete_import(int(del_id), brand_id):
+                invalidate_brand_data_cache()
                 st.success(f"Deleted import {del_id}.")
                 st.rerun()
             else:
@@ -1389,7 +1410,7 @@ with tab_export:
                "history right at the rename. This checks for near-identical names whose active dates don't "
                "overlap (a real rename: the old name stops right around when the new one starts) and "
                "suggests merging them. Always a suggestion you confirm — nothing merges on its own.")
-    rename_check_rows = db.rows_for_brand(brand_id)
+    rename_check_rows = cached_rows_for_brand(brand_id)
     if not rename_check_rows:
         st.caption("No data yet.")
     else:
@@ -1408,12 +1429,13 @@ with tab_export:
                     )
                     if st.button(f"Merge under '{r['new_name']}'", key=f"merge_rename_{i}"):
                         n = db.rename_campaign(brand_id, r["platform"], r["old_name"], r["new_name"])
+                        invalidate_brand_data_cache()
                         st.success(f"Merged {n} row(s) — '{r['old_name']}' now reports as '{r['new_name']}'.")
                         st.rerun()
 
     st.markdown("---")
     st.write("**Export normalized data**")
-    all_rows = db.rows_for_brand(brand_id)
+    all_rows = cached_rows_for_brand(brand_id)
     if all_rows:
         export_df = pd.DataFrame([dict(r) for r in all_rows])
         st.download_button("Download CSV (normalized rows)", export_df.to_csv(index=False),

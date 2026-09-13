@@ -21,11 +21,31 @@ from contextlib import contextmanager
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from dotenv import load_dotenv
 
 load_dotenv()  # no-op if there's no local .env file (e.g. on a host that sets real env vars)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Every call used to open a brand-new TCP+SSL+auth connection and tear it
+# down again (Streamlit reruns the whole script on every widget interaction,
+# so a single click could open a dozen+ short-lived connections). A small
+# pool reuses live connections instead — max size kept modest since a
+# managed free-tier Postgres (Supabase/Render) caps concurrent connections
+# and this is one pool per app process. Override via DB_POOL_MAX_CONN if a
+# given deployment needs more headroom.
+_POOL_MAX_CONN = int(os.environ.get("DB_POOL_MAX_CONN", "5"))
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            1, _POOL_MAX_CONN, DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor
+        )
+    return _pool
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS brands (
@@ -125,15 +145,25 @@ def get_conn():
             "DATABASE_URL isn't set. Local dev: put it in a .env file in the project "
             "root (never committed). Deployed: set it as a platform secret/env var."
         )
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    pool = _get_pool()
+    conn = pool.getconn()
+    broken = False
     try:
         yield conn
         conn.commit()
+    except psycopg2.OperationalError:
+        # The server dropped this pooled connection (idle timeout, restart,
+        # etc.) without the pool knowing — discard it instead of returning a
+        # dead connection that would just fail again for the next caller.
+        # The action itself surfaces an error once; the next attempt gets a
+        # fresh connection from the pool.
+        broken = True
+        raise
     except Exception:
         conn.rollback()
         raise
     finally:
-        conn.close()
+        pool.putconn(conn, close=broken)
 
 
 def init_db():
