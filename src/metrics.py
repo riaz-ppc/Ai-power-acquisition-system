@@ -678,6 +678,85 @@ def keyword_waste_candidates(df: pd.DataFrame, min_clicks: int = 15) -> list[dic
     return candidates
 
 
+_KEYWORD_STOPWORDS = {
+    "a", "an", "the", "and", "or", "of", "to", "for", "in", "on", "at", "by",
+    "with", "near", "me", "my", "your", "you", "is", "are", "how", "what",
+    "best", "top", "vs", "uk", "online", "course", "courses", "training",
+}
+
+
+def keyword_word_waste(df: pd.DataFrame, min_clicks: int = 15) -> list[dict]:
+    """
+    Catches waste keyword_waste_candidates can't see: a WORD that recurs
+    across several different keyword phrases, each too thin on its own
+    (fewer than min_clicks) to clear that function's bar, but collectively
+    burning real spend with zero conversions. This is the same idea as a
+    true search-term n-gram report (a word like "free" showing up across
+    a dozen zero-converting queries), applied to bid keyword TEXT instead
+    of actual search queries — this app doesn't import search-term
+    reports (a different report type from the keyword performance
+    reports it reads today), so keyword text is the only signal
+    available without a new import path. Weaker than a real search-term
+    report (it can't see queries that never matched a converting
+    keyword's own text), but still a genuine, actionable signal.
+
+    Same statistical bar as keyword_waste_candidates: rule-of-three upper
+    bound on the word's true conversion rate, judged against this
+    account's own blended conversion rate — not an arbitrary threshold.
+    """
+    import re
+
+    if df.empty or "keyword" not in df.columns:
+        return []
+    kw_df = df[df["keyword"].notna() & df["platform"].isin(["google", "microsoft"])]
+    if kw_df.empty:
+        return []
+
+    kw_agg = kw_df.groupby(["platform", "keyword"], dropna=False).agg(
+        spend=("spend", "sum"), clicks=("clicks", "sum"), conversions=("conversions", "sum")
+    ).reset_index()
+
+    converting = kw_agg[kw_agg["conversions"] > 0]
+    total_clicks, total_conversions = converting["clicks"].sum(), converting["conversions"].sum()
+    account_cvr = (total_conversions / total_clicks) if total_clicks else None
+
+    # Explode each keyword phrase into the distinct words it contains,
+    # carrying that keyword's own totals to every word — a word shared by
+    # several keywords picks up each one's spend/clicks/conversions.
+    exploded = []
+    for _, r in kw_agg.iterrows():
+        words = {
+            w for w in re.findall(r"[a-z0-9']+", str(r["keyword"]).lower())
+            if w not in _KEYWORD_STOPWORDS and len(w) > 2
+        }
+        for w in words:
+            exploded.append({"word": w, "spend": r["spend"], "clicks": r["clicks"], "conversions": r["conversions"]})
+    if not exploded:
+        return []
+
+    word_agg = pd.DataFrame(exploded).groupby("word").agg(
+        spend=("spend", "sum"), clicks=("clicks", "sum"), conversions=("conversions", "sum"),
+        keyword_count=("word", "count"),
+    ).reset_index()
+
+    candidates = []
+    for _, r in word_agg.iterrows():
+        if r["clicks"] < min_clicks or r["conversions"] > 0 or r["keyword_count"] < 2:
+            continue
+        upper_bound_cvr = 3 / r["clicks"]
+        if account_cvr is not None and upper_bound_cvr >= account_cvr:
+            continue
+        candidates.append({
+            "word": r["word"], "spend": float(r["spend"]), "clicks": int(r["clicks"]),
+            "keyword_count": int(r["keyword_count"]),
+            "upper_bound_cvr_pct": round(upper_bound_cvr * 100, 2),
+            "account_cvr_pct": round(float(account_cvr) * 100, 2) if account_cvr is not None else None,
+        })
+
+    candidates.sort(key=lambda c: -c["spend"])
+    return candidates
+
+
 def two_proportion_z_test(conv_a: float, n_a: float, conv_b: float, n_b: float) -> dict:
     """
     Two-proportion z-test for "is variant B's conversion rate really
