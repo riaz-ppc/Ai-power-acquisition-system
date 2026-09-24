@@ -1,5 +1,9 @@
 streamlit==1.38.0
 pandas==2.2.2
+# Pinned: unpinned, a fresh deploy pulls the newest NumPy, and pandas 2.2.2 uses a
+# NumPy API that newer releases are deprecating toward an error. 2.5.3 is the
+# version the test suite runs against.
+numpy==2.5.3
 openpyxl==3.1.5
 altair==5.3.0
 reportlab==5.0.1
@@ -8,3 +12,4 @@ facebook-business==26.0.1
 pyyaml==6.0.3
 psycopg2-binary==2.9.13
 python-dotenv==1.0.1
+anthropic==1.8.0

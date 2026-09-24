@@ -465,13 +465,21 @@ def detect_campaign_renames(df: pd.DataFrame, min_similarity: float = 0.85,
     side by side, which would mean they're genuinely different
     concurrent campaigns that just happen to share wording.
 
+    Also requires each name to have dates of its own — the old name
+    before, the new name after. Without that there's no "stopped here,
+    started there" at all: whole-period summary imports put every
+    campaign on the same single date, so two names that only ever appear
+    together were running side by side in the same report (e.g. "LOLER
+    Inspection" and "LOLER Training (pause ...)" — different courses),
+    and the span-overlap check alone would wrongly pass them.
+
     Every result is a SUGGESTION for the viewer to confirm — nothing
     here merges anything on its own.
     """
     if df.empty:
         return []
     spans = df.groupby(["platform", "campaign"], dropna=False).agg(
-        start=("date", "min"), end=("date", "max")
+        start=("date", "min"), end=("date", "max"), dates=("date", lambda s: frozenset(s))
     ).reset_index()
 
     candidates = []
@@ -504,8 +512,10 @@ def detect_campaign_renames(df: pd.DataFrame, min_similarity: float = 0.85,
                 overlap_days = max(0, (overlap_end - overlap_start).days + 1)
                 if overlap_days > max_overlap_days:
                     continue
+                if not (shorter_rec["dates"] - longer_rec["dates"]) or not (longer_rec["dates"] - shorter_rec["dates"]):
+                    continue  # no before/after — the two names only ever ran together
 
-                if s_start <= l_start:
+                if (s_start, s_end) <= (l_start, l_end):
                     old_rec, new_rec = shorter_rec, longer_rec
                 else:
                     old_rec, new_rec = longer_rec, shorter_rec
