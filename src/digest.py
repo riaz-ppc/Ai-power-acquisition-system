@@ -138,6 +138,16 @@ def compute_digest_items(df: pd.DataFrame, brand: dict, n: int = 7) -> list[dict
                               f"of roughly {money(cp_test_amount, brand['currency'])} toward {cp_best['platform']}.",
                 })
 
+    # Per-course platform asymmetries — the one signal the platform-level
+    # reallocation above can't see. Only "shift": below-break-even courses
+    # are already covered campaign-by-campaign by generate_insights().
+    for course in [c for c in metrics.course_platform_view(camp_scoped, brand) if c["verdict"] == "shift"][:3]:
+        items.append({
+            "priority": 2, "impact": course["test_amount"], "badge": "🟢",
+            "title": f"{course['course'].title()}: shift budget between platforms",
+            "detail": course["detail"],
+        })
+
     waste = metrics.keyword_waste_candidates(camp_scoped)
     if waste:
         total_waste_spend = sum(w["spend"] for w in waste)
