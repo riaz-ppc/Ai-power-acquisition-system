@@ -28,6 +28,17 @@ rather than a local file.
 streamlit run app.py
 ```
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Tests cover the pure logic (import parsing/platform detection, the
+statistical checks, the digest, course grouping, DB connection pooling)
+and need no database.
+
 ## Syncing ad platform data
 
 - `sync/google_ads/` — pulls reports via the Google Ads API. Configure from

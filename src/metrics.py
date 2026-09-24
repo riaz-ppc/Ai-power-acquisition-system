@@ -757,6 +757,180 @@ def keyword_word_waste(df: pd.DataFrame, min_clicks: int = 15) -> list[dict]:
     return candidates
 
 
+# Words that describe HOW a course is advertised (campaign type, generic
+# filler), not WHICH course — stripped so "First Aid PMX" (Google) and
+# "First Aid CAT" (Bing) land on the same course.
+_COURSE_NOISE_TOKENS = {"pmx", "pmax", "cat", "search", "training", "course", "courses"}
+
+
+def course_key(campaign: str) -> str:
+    """
+    Reduces a campaign name to the course it's selling, so the same course
+    run on several platforms under different names groups together:
+    "AML Training (L 5 March)" and "AML (Relanuch 14 July)" -> "aml".
+
+    Drops parenthetical notes (relaunch dates, "flop", "Copy Updated ..." —
+    including an unclosed one like "COSHH (Relaunched- 12th Aug"), version
+    tags ("V-2.0"), punctuation, and campaign-type words (_COURSE_NOISE_TOKENS).
+    Deliberately an exact match on what's left, not fuzzy: fuzzy matching
+    would merge genuinely different courses ("Food Hygiene Level 2" vs
+    "Level 3"). The UI shows every grouped campaign name so a wrong
+    grouping is visible, not silent.
+    """
+    import re
+
+    s = str(campaign).lower()
+    s = re.sub(r"\(.*?(\)|$)", " ", s)
+    s = re.sub(r"\bv-?\d+(\.\d+)*\b|\b\d+\.\d+\b", " ", s)
+    tokens = [t for t in re.findall(r"[a-z0-9]+", s) if t not in _COURSE_NOISE_TOKENS]
+    return " ".join(tokens) or str(campaign).strip().lower()
+
+
+def _efficiency_floor(brand) -> float | None:
+    """Break-even as value-per-unit-spend (higher is better for both models):
+    transactional -> ROAS floor (1 / margin, else target ROAS);
+    lead_gen -> conversions per unit spend at target CPA."""
+    if brand["business_model"] == "transactional":
+        if brand.get("margin_pct"):
+            return 1 / brand["margin_pct"]
+        return brand.get("target_roas") or None
+    return (1 / brand["target_cpa"]) if brand.get("target_cpa") else None
+
+
+def _fmt_efficiency(eff: float | None, business_model: str, ccy: str) -> str:
+    if eff is None:
+        return "—"
+    if business_model == "transactional":
+        return f"{eff:.2f}x ROAS"
+    return "no conversions" if eff == 0 else f"{_money(1 / eff, ccy)} CPA"
+
+
+def _describe_floor(brand, floor: float) -> str:
+    """Names the assumption behind a break-even verdict, so a wrong margin
+    or target in the brand's settings is visible rather than silently
+    turning a profitable course into a 'below break-even' one."""
+    if brand["business_model"] != "transactional":
+        return f"your {_money(1 / floor, brand['currency'])} target CPA"
+    if brand.get("margin_pct"):
+        return f"the {floor:.2f}x break-even ROAS implied by your {brand['margin_pct'] * 100:.0f}% margin"
+    return f"your {floor:.2f}x target ROAS"
+
+
+_COURSE_VERDICT_RANK = {"shift": 0, "below_break_even": 1, "expand": 2, "healthy": 3, "insufficient_data": 4}
+
+
+def course_platform_view(df: pd.DataFrame, brand, min_spend: float = 50.0) -> list[dict]:
+    """
+    Course-level P&L across platforms. The platform-level reallocation view
+    compares whole platforms, which hides per-course asymmetries — e.g. a
+    course at ~1x ROAS on Google but ~6x on Bing, inside platform totals
+    that look similar. Groups campaigns into courses via course_key(), then
+    judges each course x platform cell with at least `min_spend` of spend
+    (below that, one sale more or less swings the ratio too far to act on):
+
+      shift             much more efficient on one platform than another —
+                        move budget across (checked first: even when every
+                        platform is below break-even, moving spend to the
+                        better one is the most concrete action available)
+      below_break_even  under the brand's break-even floor wherever judged,
+                        with no clearly better platform to move to
+      expand            efficient on its only judged platform; other
+                        platforms this brand runs haven't had enough spend
+      healthy           nothing to act on
+      insufficient_data no cell reached min_spend
+
+    Break-even comes from the brand's own margin / targets, and every
+    verdict text names that assumption — the verdict is only as right as
+    those settings.
+
+    Works on whole-period summaries (one date per import) as well as daily
+    data — it only needs totals, not a time series.
+    """
+    if df.empty:
+        return []
+    d = df[df["campaign"].notna()].copy()
+    if d.empty:
+        return []
+    d["course"] = d["campaign"].map(course_key)
+
+    bm, ccy = brand["business_model"], brand["currency"]
+    floor = _efficiency_floor(brand)
+    active_platforms = set(d.loc[d["spend"] > 0, "platform"])
+
+    out = []
+    for course, cdf in d.groupby("course"):
+        cells = {}
+        for platform, pdf in cdf.groupby("platform"):
+            spend = float(pdf["spend"].sum())
+            conv = float(pdf["conversions"].sum())
+            rev = float(pdf["conversion_value"].sum())
+            value = rev if bm == "transactional" else conv
+            cells[platform] = {
+                "spend": spend, "conversions": conv, "revenue": rev,
+                "efficiency": (value / spend) if spend > 0 else None,
+                "campaigns": sorted(pdf["campaign"].unique()),
+            }
+        total_spend = sum(c["spend"] for c in cells.values())
+        if total_spend <= 0:
+            continue
+
+        judged = {p: c["efficiency"] for p, c in cells.items() if c["spend"] >= min_spend}
+        untried = sorted(p for p in active_platforms if cells.get(p, {}).get("spend", 0) < min_spend)
+        fmt = lambda e: _fmt_efficiency(e, bm, ccy)  # noqa: E731
+        floor_text = _describe_floor(brand, floor) if floor else None
+
+        def _thin(p):
+            # A platform with SOME spend below min_spend: say so rather than
+            # calling it untried — a weak small test is information too.
+            c = cells.get(p)
+            if c and c["spend"] > 0:
+                return f"only {_money(c['spend'], ccy)} on {p} so far ({fmt(c['efficiency'])}, too little to judge)"
+            return f"not run on {p} yet"
+
+        best = max(judged, key=judged.get) if judged else None
+        worst = min(judged, key=judged.get) if judged else None
+        big_gap = (len(judged) >= 2 and judged[best] > 0
+                   and (judged[worst] == 0 or judged[best] / judged[worst] >= 1.5
+                        or (floor is not None and judged[best] >= floor > judged[worst])))
+
+        if not judged:
+            verdict, detail = "insufficient_data", (
+                f"No platform has reached {_money(min_spend, ccy)} of spend on this course yet.")
+        elif big_gap:
+            verdict, detail = "shift", (
+                f"{fmt(judged[best])} on {best} vs {fmt(judged[worst])} on {worst} — move this "
+                f"course's budget toward {best} (test ~15% of {worst}'s "
+                f"{_money(cells[worst]['spend'], ccy)} first).")
+            if floor is not None and judged[best] < floor:
+                detail += f" Even {best} is below {floor_text}, so check the offer/landing page too."
+        elif all(e == 0 for e in judged.values()) or (floor and all(e < floor for e in judged.values())):
+            where = ", ".join(f"{p} {fmt(e)}" for p, e in judged.items())
+            basis = floor_text or "any return"
+            verdict, detail = "below_break_even", (
+                f"Below {basis} wherever there's enough spend to judge ({where}) — "
+                f"{_money(total_spend, ccy)} this period, no clearly better platform to move it to. "
+                f"Fix the offer/landing page, or cut it if your margin setting is right.")
+        elif len(judged) >= 2:
+            verdict, detail = "healthy", "Similar efficiency across platforms."
+        else:
+            only, only_e = best, judged[best]
+            if untried:
+                verdict, detail = "expand", (
+                    f"{fmt(only_e)} on {only}; {'; '.join(_thin(p) for p in untried)} "
+                    f"— worth a proper test there.")
+            else:
+                verdict, detail = "healthy", f"{fmt(only_e)} on {only}."
+
+        out.append({
+            "course": course, "verdict": verdict, "detail": detail,
+            "total_spend": total_spend, "platforms": cells,
+            "test_amount": cells[worst]["spend"] * 0.15 if verdict == "shift" else 0.0,
+        })
+
+    out.sort(key=lambda c: (_COURSE_VERDICT_RANK[c["verdict"]], -c["total_spend"]))
+    return out
+
+
 def two_proportion_z_test(conv_a: float, n_a: float, conv_b: float, n_b: float) -> dict:
     """
     Two-proportion z-test for "is variant B's conversion rate really

@@ -979,6 +979,35 @@ with tab_insights:
                                f"differ by {cp_gap_pct:.0f}%) — nothing worth shifting budget across "
                                f"platforms for yet.")
 
+        course_scoped = df[(df["date"] >= pd.Timestamp(cur_start)) & (df["date"] <= pd.Timestamp(cur_end))]
+        courses = metrics.course_platform_view(course_scoped, brand)
+        if any(len(c["platforms"]) > 1 for c in courses):
+            st.markdown("---")
+            st.markdown("#### Courses across platforms")
+            st.caption("Platform totals hide per-course differences — one course can do far better on "
+                       "Bing than Google while the platforms look similar overall. Campaigns are grouped "
+                       "into courses by name (ignoring notes in brackets, \"PMax\"/\"CAT\"/\"Training\", "
+                       "version tags), so check the Campaigns column for anything grouped wrongly. "
+                       "Break-even comes from this brand's margin/target in Settings — if a verdict "
+                       "looks wrong, check that setting first.")
+            verdict_label = {"shift": "🔀 Shift budget", "below_break_even": "🔴 Below break-even",
+                             "expand": "🟢 Test on another platform", "healthy": "✅ Healthy",
+                             "insufficient_data": "⚪ Too little spend"}
+            for c in [c for c in courses if c["verdict"] in ("shift", "below_break_even", "expand")][:8]:
+                st.markdown(f"**{verdict_label[c['verdict']]} — {md_safe(c['course'].title())}:** "
+                            f"{md_safe(c['detail'])}")
+            course_table = pd.DataFrame([{
+                "Course": c["course"].title(),
+                "Verdict": verdict_label[c["verdict"]],
+                "Platform": p,
+                "Spend": money(cell["spend"], brand["currency"]),
+                "ROAS" if brand["business_model"] == "transactional" else "CPA":
+                    metrics._fmt_efficiency(cell["efficiency"], brand["business_model"], brand["currency"]),
+                "Campaigns": ", ".join(cell["campaigns"]),
+            } for c in courses for p, cell in c["platforms"].items()])
+            with st.expander(f"All {len(courses)} courses, by platform"):
+                st.dataframe(course_table, hide_index=True, use_container_width=True)
+
         account_marginal = metrics.account_marginal_efficiency(df, brand["business_model"])
         if account_marginal:
             st.markdown("---")
