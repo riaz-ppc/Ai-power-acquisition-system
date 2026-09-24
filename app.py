@@ -987,7 +987,7 @@ with tab_insights:
                 f"Avg {realloc_metric.upper()}": fmt_realloc(r["avg_metric"]) if r["avg_metric"] is not None else "—",
                 f"Marginal {realloc_metric.upper()}": fmt_realloc(r["marginal_metric"]) if r["marginal_metric"] is not None else "—",
                 "Basis": "marginal (curve fit)" if r["marginal_metric"] is not None else "average only",
-                "Fit R²": r["r_squared"] if r["r_squared"] is not None else "—",
+                "Fit R²": f"{r['r_squared']:.2f}" if r["r_squared"] is not None else "—",
             } for r in realloc])
             st.dataframe(realloc_table, hide_index=True, use_container_width=True)
 
@@ -1026,7 +1026,7 @@ with tab_insights:
                 f"Avg {realloc_metric.upper()}": fmt_cp(r["avg_metric"]) if r["avg_metric"] is not None else "—",
                 f"Marginal {realloc_metric.upper()}": fmt_cp(r["marginal_metric"]) if r["marginal_metric"] is not None else "—",
                 "Basis": "marginal (curve fit)" if r["marginal_metric"] is not None else "average only",
-                "Fit R²": r["r_squared"] if r["r_squared"] is not None else "—",
+                "Fit R²": f"{r['r_squared']:.2f}" if r["r_squared"] is not None else "—",
             } for r in cross_platform])
             st.dataframe(cp_table, hide_index=True, use_container_width=True)
 

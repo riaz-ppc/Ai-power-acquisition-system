@@ -84,3 +84,40 @@ def test_non_ad_export_is_not_misdetected_as_a_platform():
     result = normalize.normalize_upload(order_log, "orders.csv", "USD")
     assert result.platform_id is None
     assert result.status == "failed"
+
+
+def _rows(*specs):
+    from src import metrics
+    return metrics.rows_to_df([{
+        "platform": "google", "campaign": c, "date": d, "level": "campaign", "spend": 10,
+        "impressions": 100, "clicks": 5, "conversions": 1, "conversion_value": 10,
+        "keyword": None, "ad_set": None, "ad": None, "currency": "GBP", "reach": None, "result_type": None,
+    } for c, d in specs])
+
+
+def test_rename_not_suggested_for_campaigns_side_by_side_in_one_period_summary():
+    # Monthly summary: every campaign on the same single date — both names were
+    # live in the same report, so they're different campaigns, not a rename.
+    df = _rows(("LOLER Inspection", "2026-08-31"),
+               ("LOLER Training (pause bcz people are searching loler inpections)", "2026-08-31"),
+               ("EST Food Hygiene", "2026-08-31"), ("EST Food Hygiene (Old)", "2026-08-31"))
+    assert normalize.detect_campaign_renames(df) == []
+
+
+def test_rename_across_monthly_imports_is_suggested_old_to_new():
+    df = _rows(("COSHH", "2026-07-31"), ("COSHH (Relaunched- 12th Aug", "2026-08-31"))
+    [r] = normalize.detect_campaign_renames(df)
+    assert (r["old_name"], r["new_name"]) == ("COSHH", "COSHH (Relaunched- 12th Aug")
+
+
+def test_daily_rename_with_one_transition_day_is_suggested():
+    df = _rows(*[("HSC PMX", f"2026-09-0{d}") for d in range(1, 6)],
+               *[("HSC PMX (relaunch march 4)", f"2026-09-0{d}") for d in range(5, 10)])
+    [r] = normalize.detect_campaign_renames(df)
+    assert r["new_name"] == "HSC PMX (relaunch march 4)"
+    assert r["overlap_days"] == 1
+
+
+def test_concurrent_daily_campaigns_are_not_a_rename():
+    df = _rows(*[(c, f"2026-09-0{d}") for d in range(1, 10) for c in ("HSC PMX", "HSC PMX (brand)")])
+    assert normalize.detect_campaign_renames(df) == []
