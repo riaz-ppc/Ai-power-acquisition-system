@@ -17,6 +17,7 @@ Create a `.env` file in the project root with:
 ```
 DATABASE_URL=postgresql://...
 APP_PASSWORD=your-password   # optional; leave unset to run without a login screen
+ANTHROPIC_API_KEY=sk-ant-...  # optional; enables the AI Analyst tab
 ```
 
 `DATABASE_URL` is required — the app stores data in Postgres (e.g. Supabase)
@@ -45,6 +46,19 @@ and need no database.
   `google-ads.yaml.example`.
 - `sync/meta/` — pulls reports via the Meta Business API. Configure from
   `meta-config.yaml.example`.
+
+## AI analyst
+
+The **🤖 AI Analyst** tab lets you ask questions in plain English ("which courses
+should I move budget between?", "why did ROAS change vs last month?") and
+generates a weekly briefing. Claude (`claude-opus-5`, adaptive thinking) answers
+by calling this app's own analyses as tools — account overview, campaigns,
+course view, insights, keyword waste, digest — so every number it quotes comes
+from your imported data. It only reads data; it has no access to the ad accounts.
+
+Enable it by setting `ANTHROPIC_API_KEY` (Streamlit Cloud: app settings → Secrets;
+locally: `.env`). Without a key the tab shows setup instructions instead. Set
+`AI_ANALYST_MODEL` to use a different Claude model. Code: `src/ai_analyst.py`.
 
 ## Scheduled digest (Slack/email)
 

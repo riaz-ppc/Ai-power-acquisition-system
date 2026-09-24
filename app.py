@@ -15,10 +15,11 @@ from datetime import date, datetime, timedelta
 from io import BytesIO, StringIO
 
 import altair as alt
+import anthropic
 import pandas as pd
 import streamlit as st
 
-from src import db, mapping, metrics, normalize, orders, report
+from src import ai_analyst, db, mapping, metrics, normalize, orders, report
 from src.digest import (
     _format_decomposition, brand_dict, compute_digest_items, money, pct, ratio,
 )
@@ -411,8 +412,9 @@ st.sidebar.caption(
     f"conversion = {brand['conversion_type']}"
 )
 
-tab_import, tab_digest, tab_dash, tab_insights, tab_tests, tab_recon, tab_export = st.tabs(
-    ["📥 Import", "🗞️ Digest", "📊 Dashboard", "🧭 Insights", "🧪 A/B Tests", "💷 Reconciliation", "⚙️ Settings & Export"]
+tab_import, tab_digest, tab_ai, tab_dash, tab_insights, tab_tests, tab_recon, tab_export = st.tabs(
+    ["📥 Import", "🗞️ Digest", "🤖 AI Analyst", "📊 Dashboard", "🧭 Insights", "🧪 A/B Tests",
+     "💷 Reconciliation", "⚙️ Settings & Export"]
 )
 
 # ---------------------------------------------------------------- import --
@@ -603,6 +605,76 @@ with tab_digest:
             if len(items) > len(shown):
                 st.caption(f"{len(items) - len(shown)} more signal(s) not shown here — "
                            f"see Insights and Reconciliation for full detail.")
+
+# ------------------------------------------------------------- ai analyst --
+
+with tab_ai:
+    st.subheader(f"AI analyst — {selected_name}")
+    st.caption("Ask anything about this brand's performance in plain English. Claude answers by running "
+               "this app's own analyses — course view, insights, keyword waste, the digest — so every "
+               "number it quotes comes from your imported data, not guesswork. It can read your data but "
+               "can't change anything in your ad accounts.")
+    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+        st.info("To turn this on, add an **ANTHROPIC_API_KEY** — in Streamlit Cloud's app settings "
+                "under Secrets (`ANTHROPIC_API_KEY = \"sk-ant-...\"`), or in `.env` locally. Get a key at "
+                "console.anthropic.com. Each question typically costs a few pence in API usage.")
+    else:
+        ai_rows = cached_rows_for_brand(brand_id)
+        if not ai_rows:
+            st.info("No data yet — import a report first.")
+        else:
+            ai_df = metrics.rows_to_df(ai_rows)
+            # Per-brand conversation: API history (tool calls included, needed for
+            # follow-ups) and the display transcript are kept separately.
+            hist_key, chat_key = f"ai_history_{brand_id}", f"ai_chat_{brand_id}"
+            st.session_state.setdefault(hist_key, [])
+            st.session_state.setdefault(chat_key, [])
+
+            b1, b2 = st.columns([1, 1])
+            want_briefing = b1.button("📝 Write this week's briefing", use_container_width=True)
+            if b2.button("Clear conversation", use_container_width=True):
+                st.session_state[hist_key], st.session_state[chat_key] = [], []
+                st.rerun()
+
+            if not st.session_state[chat_key]:
+                st.caption("Try: *Which courses should I move budget between?* · *Why did ROAS change "
+                           "vs last month?* · *What's wasting the most money right now?* · *Where would "
+                           "an extra £500 do the most good?*")
+
+            for msg in st.session_state[chat_key]:
+                with st.chat_message(msg["role"]):
+                    st.markdown(md_safe(msg["text"]))
+                    if msg.get("meta"):
+                        st.caption(msg["meta"])
+
+            question = st.chat_input("Ask about campaigns, courses, budget, waste…", key=f"ai_input_{brand_id}")
+            if want_briefing:
+                question = ai_analyst.BRIEFING_QUESTION
+
+            if question:
+                shown_q = "Write this week's briefing" if want_briefing else question
+                st.session_state[chat_key].append({"role": "user", "text": shown_q})
+                with st.chat_message("user"):
+                    st.markdown(md_safe(shown_q))
+                with st.chat_message("assistant"):
+                    try:
+                        with st.spinner("Analysing your data…"):
+                            reply = ai_analyst.ask(st.session_state[hist_key], question, ai_df, brand)
+                        steps = ", ".join(dict.fromkeys(t.replace("get_", "").replace("_", " ")
+                                                        for t in reply.tools_used))
+                        meta = (f"Checked: {steps} · " if steps else "") + \
+                               f"{reply.input_tokens + reply.output_tokens:,} tokens"
+                        st.markdown(md_safe(reply.text))
+                        st.caption(meta)
+                        st.session_state[chat_key].append({"role": "assistant", "text": reply.text, "meta": meta})
+                    except anthropic.AuthenticationError:
+                        st.error("The Anthropic API key was rejected — check ANTHROPIC_API_KEY in your secrets.")
+                    except anthropic.RateLimitError:
+                        st.error("Hit the Anthropic API rate limit — wait a minute and try again.")
+                    except anthropic.APIStatusError as e:
+                        st.error(f"The Anthropic API returned an error ({e.status_code}) — try again shortly.")
+                    except anthropic.APIConnectionError:
+                        st.error("Couldn't reach the Anthropic API — check the network connection.")
 
 # -------------------------------------------------------------- dashboard --
 
